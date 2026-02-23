@@ -1,0 +1,96 @@
+# ============================================================
+# Client Memory Template — Counsel (Legal Agent)
+# Copy this file as <client-slug>.yaml to create a new client.
+# This file is LOCAL ONLY. Never send to cloud AI without anonymization.
+# ============================================================
+
+# Client Identity
+client_id: ""                       # Unique slug, must match filename (e.g., "acme-corp")
+legal_name: ""                      # Full legal name of the primary entity
+legal_name_local: ""                # Native-script name if applicable (e.g., Chinese/Korean)
+entity_type: ""                     # corporation | llc | lp | individual | trust | foundation
+jurisdiction: ""                    # Jurisdiction of incorporation/formation
+registration_number: ""
+tax_id: ""                          # EIN (US), UTR (UK), USCI (PRC), etc.
+date_of_incorporation: ""
+
+# Registered Address
+registered_address:
+  street: ""
+  city: ""
+  state: ""
+  country: ""
+  postal_code: ""
+
+# Primary Contact
+primary_contact:
+  name: ""
+  title: ""
+  email: ""
+  phone: ""
+
+# Additional Contacts
+contacts: []
+  # - name: ""
+  #   title: ""
+  #   email: ""
+  #   phone: ""
+
+# Authorized Signatories
+signatories: []
+  # - name: ""
+  #   title: ""
+  #   authority: full             # full | limited | board_resolution_required
+
+# Client Preferences
+preferences:
+  governing_law: "New York"         # Default for NY-based practice
+  arbitration_venue: ""
+  contract_language: English        # English | Chinese | Bilingual
+  currency: USD
+  date_format: "YYYY-MM-DD"
+  notes: ""                         # e.g., "Prefers all-caps headings"
+
+# Banking Details (for payment/escrow clauses)
+banking: []
+  # - label: ""
+  #   bank_name: ""
+  #   account_name: ""
+  #   account_number: ""
+  #   swift_code: ""
+  #   currency: USD
+
+# Related Entities (subsidiaries, affiliates, parent companies, etc.)
+related_entities: []
+  # - legal_name: ""
+  #   legal_name_local: ""
+  #   entity_type: ""
+  #   jurisdiction: ""
+  #   relationship: subsidiary    # subsidiary | parent | affiliate | gp | lp | trustee | beneficiary
+  #   registration_number: ""
+  #   tax_id: ""
+  #   registered_address:
+  #     street: ""
+  #     city: ""
+  #     state: ""
+  #     country: ""
+  #     postal_code: ""
+  #   signatories: []
+
+# Active Matters
+matters: []
+  # - id: ""
+  #   description: ""
+  #   status: active              # active | pending | closed
+  #   counterparty: ""
+  #   opened: ""
+
+# Common Counterparties
+counterparties: []
+  # - name: ""
+  #   name_local: ""
+  #   jurisdiction: ""
+  #   contact: ""
+
+# Notes
+notes: ""

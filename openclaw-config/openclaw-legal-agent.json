@@ -1,0 +1,22 @@
+{
+  "id": "legal",
+  "workspace": "~/.openclaw/workspace-legal",
+  "model": {
+    "primary": "ollama/qwen3:30b-a3b",
+    "fallbacks": [
+      "moonshot/kimi-k2.5",
+      "anthropic/claude-sonnet-4-5",
+      "openrouter/z-ai/glm-5"
+    ]
+  },
+  "identity": {
+    "name": "Counsel",
+    "theme": "legal assistant",
+    "emoji": "balance_scale"
+  },
+  "subagents": {
+    "allowAgents": [
+      "main"
+    ]
+  }
+}

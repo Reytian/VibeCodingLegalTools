@@ -1,0 +1,130 @@
+# Client Memory File — Counsel (Legal Agent)
+# LOCAL ONLY. Never transmit to cloud AI without anonymization.
+
+# Client Identity
+client_id: sample-globalventures
+legal_name: Global Ventures Holdings Ltd.
+legal_name_local: ""
+entity_type: corporation
+jurisdiction: Cayman Islands
+registration_number: "MC-384521"
+tax_id: ""
+date_of_incorporation: "2023-06-15"
+
+# Registered Address
+registered_address:
+  street: "P.O. Box 309, Ugland House, South Church Street"
+  city: George Town
+  state: Grand Cayman
+  country: Cayman Islands
+  postal_code: KY1-1104
+
+# Primary Contact
+primary_contact:
+  name: David Chen
+  title: Director
+  email: david.chen@globalventures.ky
+  phone: "+1 (212) 555-0199"
+
+# Additional Contacts
+contacts:
+  - name: Sarah Lin
+    title: General Counsel
+    email: sarah.lin@globalventures.ky
+    phone: "+852 9876-5432"
+
+# Authorized Signatories
+signatories:
+  - name: David Chen
+    title: Director
+    authority: full
+  - name: Sarah Lin
+    title: General Counsel
+    authority: limited
+
+# Client Preferences
+preferences:
+  governing_law: "New York"
+  arbitration_venue: "ICC, New York"
+  contract_language: English
+  currency: USD
+  date_format: "YYYY-MM-DD"
+  notes: "Board resolution required for transactions over USD 5M."
+
+# Banking Details
+banking:
+  - label: "Primary USD Account"
+    bank_name: HSBC Hong Kong
+    account_name: Global Ventures Holdings Ltd.
+    account_number: "400-123456-001"
+    swift_code: HSBCHKHHHKH
+    currency: USD
+
+# Related Entities
+related_entities:
+  - legal_name: GV Capital Management LLC
+    legal_name_local: ""
+    entity_type: llc
+    jurisdiction: Delaware
+    relationship: subsidiary
+    registration_number: ""
+    tax_id: "87-1234567"
+    registered_address:
+      street: "1209 Orange Street"
+      city: Wilmington
+      state: Delaware
+      country: United States
+      postal_code: "19801"
+    signatories:
+      - name: David Chen
+        title: Managing Member
+        authority: full
+
+  - legal_name: Shenzhen GV Technology Co., Ltd.
+    legal_name_local: "深圳环球创投科技有限公司"
+    entity_type: corporation
+    jurisdiction: PRC (Shenzhen)
+    relationship: subsidiary
+    registration_number: ""
+    tax_id: "91440300MA5G1RXH29"
+    registered_address:
+      street: "Room 2301, Tower A, Shenzhen Bay Eco-Technology Park"
+      city: Shenzhen
+      state: Guangdong
+      country: China
+      postal_code: "518000"
+    signatories:
+      - name: Zhang Wei
+        title: Legal Representative
+        authority: full
+
+# Active Matters
+matters:
+  - id: "GV-2026-001"
+    description: "Series B fundraising — USD 15M convertible note"
+    status: active
+    counterparty: "Horizon Capital Partners"
+    opened: "2026-01-10"
+  - id: "GV-2026-002"
+    description: "Employment agreements for Shenzhen subsidiary"
+    status: pending
+    counterparty: ""
+    opened: "2026-02-05"
+
+# Common Counterparties
+counterparties:
+  - name: Horizon Capital Partners
+    name_local: ""
+    jurisdiction: "Delaware, USA"
+    contact: "James Wu (jwu@horizoncap.com)"
+  - name: Shanghai Starchen Technology Co., Ltd.
+    name_local: "上海星辰科技有限公司"
+    jurisdiction: "PRC (Shanghai)"
+    contact: "Li Ming (liming@starchentech.cn)"
+
+# Notes
+notes: |
+  - David Chen has full signing authority for routine matters.
+  - Sarah Lin handles day-to-day legal coordination.
+  - Prefers English-only documentation; Chinese translations only when required by PRC filings.
+  - Standard engagement letter on file (signed 2023-08).
