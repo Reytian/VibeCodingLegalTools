@@ -79,7 +79,7 @@ ollama create qwen3.5-legal -f Modelfile
 
 ## Benchmark Results
 
-Tested on Mac Mini M4 Pro (64GB RAM). The fine-tuned Q5 model achieved **perfect 30/30** across all tests.
+Tested on Mac Mini M4 Pro (32GB RAM). The fine-tuned Q5 model achieved **perfect 30/30** across all tests.
 
 | Model | LDA Simple | LDA Complex | Resolution | Memo | Planning | Tool Use | **Total** | Avg t/s |
 |-------|-----------|-------------|------------|------|----------|----------|-----------|---------:|
