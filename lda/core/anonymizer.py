@@ -1,10 +1,11 @@
 """
-Anonymization engine — two-pass scanning + replacement + mapping generation.
+Anonymization engine — LLM extraction + regex supplement + replacement.
 
 Workflow:
-1. Pass 1: Extract entity definitions and alias relationships from key sections
-2. Pass 2: Scan full document segment by segment for all sensitive items
-3. Execute replacement: Replace sensitive items with placeholders, generate mapping
+1. Pass 1 (LLM): Extract entity definitions and alias relationships from key sections
+2. Pass 2 (LLM): Scan full document segment by segment (fallback to Pass 1 if fails)
+3. Regex supplement: Catch emails, phones, bank accounts, IDs the LLM missed
+4. Execute replacement: Replace sensitive items with placeholders, generate mapping
 """
 
 import re
@@ -16,20 +17,160 @@ from core.section_detector import detect_key_sections
 
 logger = logging.getLogger(__name__)
 
+# Role labels that should NOT be anonymized — they are structural, not PII
+ROLE_LABELS = {
+    "甲方", "乙方", "丙方", "丁方",
+    "转让方", "受让方", "出让方", "承租方", "出租方",
+    "借款方", "贷款方", "担保方", "委托方", "受托方",
+    "发起方", "接收方", "买方", "卖方",
+    "Party A", "Party B", "Party C", "Party D",
+    "Transferor", "Transferee", "Buyer", "Seller",
+    "Lender", "Borrower", "Guarantor", "Lessor", "Lessee",
+    "Licensor", "Licensee", "Assignor", "Assignee",
+    "目标公司", "Target", "Target Company", "the Company",
+    "the Target", "the Buyer", "the Seller",
+}
+
+# Regex patterns for sensitive data the LLM commonly misses
+_REGEX_PATTERNS = [
+    # Email addresses
+    ("email", re.compile(r'[\w.+-]+@[\w.-]+\.\w{2,}')),
+    # Phone: +86 138-1234-5678, +1 (212) 555-0199, etc.
+    ("phone", re.compile(r'\+\d{1,3}[\s.-]?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{4}')),
+    # Bank account numbers (16-19 consecutive digits)
+    ("bank", re.compile(r"\b\d{16,19}\b")),
+    # Unified Social Credit Code (18 chars: digits + uppercase letters)
+    ("regnum", re.compile(r'\b[0-9A-HJ-NP-Z]{2}\d{6}[0-9A-HJ-NP-Z]{10}\b')),
+    # Cayman/BVI registration numbers like 2024-C-001234
+    ("regnum", re.compile(r'\b\d{4}-[A-Z]-\d{4,8}\b')),
+    # US street addresses: "7 Clyde Road, Somerset New Jersey 08873"
+    # Matches both state abbreviation (NJ) and full state name (New Jersey)
+    ("address", re.compile(
+        r'\d+\s+[\w\s]+?\b(?:Road|Street|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct|Place|Pl|Circle|Cir|Terrace|Ter|Trail|Trl|Pike|Highway|Hwy)\b'
+        r'[.,]?\s*(?:(?:Suite|Ste|Apt|Unit|Floor|Fl|#)\s*[\w-]+[.,]?\s*)?'
+        r'[\w\s]+?[,\s]+(?:\b[A-Z]{2}\b|(?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New\s+Hampshire|New\s+Jersey|New\s+Mexico|New\s+York|North\s+Carolina|North\s+Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode\s+Island|South\s+Carolina|South\s+Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West\s+Virginia|Wisconsin|Wyoming))\s+\d{5}(?:-\d{4})?',
+        re.IGNORECASE,
+    )),
+    # Dollar amounts: $300,000 or $1,500,000.00
+    ("amount", re.compile(r'\$[\d,]+(?:\.\d{1,2})?')),
+]
+
+
+def _regex_entity_scan(text: str) -> list[dict]:
+    """Scan text with regex patterns to find entities the LLM may have missed."""
+    found = []
+    for entity_type, pattern in _REGEX_PATTERNS:
+        for match in pattern.finditer(text):
+            found.append({
+                "text": match.group(0),
+                "type": entity_type,
+                "canonical": "",
+            })
+    return found
+
+
+def _sweep_signature_block_names(text: str, entities: list[dict]) -> list[dict]:
+    """Find person names near /s/ signature markers that the LLM missed.
+
+    Looks for known person entity names (or parts of multi-word names) appearing
+    within a few lines after a /s/ marker.
+    """
+    person_entities = [
+        e for e in entities
+        if e.get("type") == "person" and e.get("text", "").strip()
+    ]
+    if not person_entities:
+        return []
+
+    # Find all /s/ marker positions
+    sig_pattern = re.compile(r'/s/', re.IGNORECASE)
+    found = []
+    known_texts = {e.get("text", "") for e in entities}
+
+    for sig_match in sig_pattern.finditer(text):
+        # Look at the 300 chars after each /s/ marker
+        window_start = sig_match.end()
+        window_end = min(len(text), window_start + 300)
+        window = text[window_start:window_end]
+
+        for person in person_entities:
+            person_name = person.get("text", "").strip()
+            if not person_name:
+                continue
+            canonical = person.get("canonical", "").strip() or person_name
+
+            # Check for name parts (first name, last name) in the window
+            # Even if the full name exists, there may be split/formatted variants
+            name_parts = person_name.split()
+            for part in name_parts:
+                if len(part) < 3:
+                    continue
+                if part in window and part not in known_texts:
+                    found.append({
+                        "text": part,
+                        "type": "person",
+                        "canonical": canonical,
+                    })
+                    known_texts.add(part)
+                    logger.info("Signature sweep found name part: %s (canonical: %s)", part, canonical)
+
+    return found
+
+
+def _sweep_header_company_names(text: str, entities: list[dict]) -> list[dict]:
+    """Ensure company names found by the LLM are also caught in the document header.
+
+    If a company entity was identified anywhere in the document, scan the first
+    500 characters for that same company name. If present but not yet in the
+    entity list, add it so the replacement step catches it.
+
+    This is a no-op for replacement (same text will map to same placeholder),
+    but ensures the header occurrence is not missed during replacement.
+    """
+    company_entities = [
+        e for e in entities
+        if e.get("type") == "company" and e.get("text", "").strip()
+    ]
+    if not company_entities:
+        return []
+
+    header = text[:500]
+    found = []
+    known_texts = {e.get("text", "") for e in entities}
+
+    for company in company_entities:
+        company_name = company.get("text", "").strip()
+        if not company_name:
+            continue
+        # The company name is already in entities — just verify it appears in header
+        # The replacement engine will handle it. But if there are partial variants
+        # in the header (e.g. without "Inc." suffix), try to catch those too.
+        canonical = company.get("canonical", "").strip() or company_name
+
+        # Also check for company name without common suffixes
+        base_variants = [company_name]
+        for suffix in [", Inc.", " Inc.", ", LLC", " LLC", ", Ltd.", " Ltd.",
+                       ", Corp.", " Corp.", ", Co.", " Co.", ", L.P.", " L.P."]:
+            if company_name.endswith(suffix):
+                base_variants.append(company_name[: -len(suffix)])
+
+        for variant in base_variants:
+            if variant in header and variant not in known_texts:
+                found.append({
+                    "text": variant,
+                    "type": "company",
+                    "canonical": canonical,
+                })
+                known_texts.add(variant)
+                logger.info("Header sweep found company variant: %s", variant)
+
+    return found
+
 
 # ============================================================
 # Pass 1: Extract entity definitions and aliases
 # ============================================================
 def run_first_pass(text: str) -> dict:
-    """
-    Pass 1: Extract entity definitions and alias relationships from key sections.
-
-    Args:
-        text: Full document text
-
-    Returns:
-        Structured data: {"aliases": [...], "entities": [...]}
-    """
     key_sections = detect_key_sections(text)
     logger.info("Pass 1: Extracted key sections (%d chars)", len(key_sections))
 
@@ -59,18 +200,7 @@ def run_first_pass(text: str) -> dict:
 # ============================================================
 # Pass 2: Scan full document for all sensitive items
 # ============================================================
-def _split_into_segments(text: str, max_chars: int = 10000) -> list[str]:
-    """
-    Split text into segments by paragraph, each no longer than max_chars.
-    Single paragraphs exceeding the limit are further split by sentence.
-
-    Args:
-        text: Full document text
-        max_chars: Maximum characters per segment (default 10000 for faster processing)
-
-    Returns:
-        List of text segments
-    """
+def _split_into_segments(text: str, max_chars: int = 20000) -> list[str]:
     paragraphs = text.split("\n")
     segments = []
     current_segment = ""
@@ -104,15 +234,6 @@ def _split_into_segments(text: str, max_chars: int = 10000) -> list[str]:
 
 
 def _build_alias_context(pass1_result: dict) -> str:
-    """
-    Format Pass 1 results as context text for Pass 2 prompts.
-
-    Args:
-        pass1_result: Structured data from Pass 1
-
-    Returns:
-        Formatted alias context string
-    """
     lines = []
     for alias_group in pass1_result.get("aliases", []):
         canonical = alias_group.get("canonical", "")
@@ -132,17 +253,6 @@ def run_second_pass(
     pass1_result: dict,
     progress_callback=None,
 ) -> list[dict]:
-    """
-    Pass 2: Scan full document segment by segment for all sensitive items.
-
-    Args:
-        text: Full document text
-        pass1_result: Structured data from Pass 1
-        progress_callback: Optional callback taking (current_segment, total_segments)
-
-    Returns:
-        De-duplicated entity list: [{"text": ..., "type": ..., "canonical": ...}, ...]
-    """
     segments = _split_into_segments(text)
     alias_context = _build_alias_context(pass1_result)
     logger.info("Pass 2: Scanning %d segments", len(segments))
@@ -163,11 +273,30 @@ def run_second_pass(
         try:
             response_text = call_llm(messages)
             entities = parse_json_response(response_text)
+            if isinstance(entities, dict) and "entities" in entities:
+                entities = entities["entities"]
             if isinstance(entities, list):
                 all_entities.extend(entities)
         except Exception as e:
-            logger.warning("Segment %d scan failed: %s", i + 1, e)
+            logger.warning("Segment %d LLM scan failed: %s", i + 1, e)
             continue
+
+    # Regex supplement: catch patterns the LLM missed
+    regex_entities = _regex_entity_scan(text)
+    if regex_entities:
+        logger.info("Regex supplement found %d additional candidates", len(regex_entities))
+        all_entities.extend(regex_entities)
+
+    # Context-aware sweeps: catch names near /s/ markers and companies in headers
+    sig_entities = _sweep_signature_block_names(text, all_entities)
+    if sig_entities:
+        logger.info("Signature sweep found %d additional name parts", len(sig_entities))
+        all_entities.extend(sig_entities)
+
+    header_entities = _sweep_header_company_names(text, all_entities)
+    if header_entities:
+        logger.info("Header sweep found %d additional company variants", len(header_entities))
+        all_entities.extend(header_entities)
 
     # De-duplicate by (text, type)
     seen = set()
@@ -178,7 +307,7 @@ def run_second_pass(
             seen.add(key)
             unique_entities.append(entity)
 
-    # Fallback: if Pass 2 found no entities (e.g. timeout), use Pass 1 entities
+    # Fallback: if Pass 2 + regex found no entities, use Pass 1 entities
     if not unique_entities and pass1_result.get("entities"):
         logger.warning(
             "Pass 2 found no entities — falling back to %d entities from Pass 1",
@@ -188,6 +317,29 @@ def run_second_pass(
             e for e in pass1_result["entities"]
             if e.get("text", "").strip()
         ]
+    elif not unique_entities:
+        # Use Pass 1 entities as base, then merge
+        unique_entities = [
+            e for e in pass1_result.get("entities", [])
+            if e.get("text", "").strip()
+        ]
+    else:
+        # Merge Pass 1 entities into Pass 2 results (Pass 1 as base)
+        pass1_entities = pass1_result.get("entities", [])
+        pass1_seen = {(e.get("text", ""), e.get("type", "")) for e in unique_entities}
+        for e in pass1_entities:
+            key = (e.get("text", ""), e.get("type", ""))
+            if key not in pass1_seen and e.get("text", "").strip():
+                unique_entities.append(e)
+                pass1_seen.add(key)
+
+    # Always merge regex results with whatever we have
+    existing_texts = {e.get("text", "") for e in unique_entities}
+    for re_entity in regex_entities:
+        if re_entity["text"] not in existing_texts:
+            unique_entities.append(re_entity)
+            existing_texts.add(re_entity["text"])
+            logger.info("Regex added: [%s] %s", re_entity["type"], re_entity["text"])
 
     _link_aliases(unique_entities, pass1_result)
 
@@ -197,14 +349,6 @@ def run_second_pass(
 
 
 def _link_aliases(entities: list[dict], pass1_result: dict):
-    """
-    Link Pass 2 entities with Pass 1 alias data.
-    Sets canonical name for entities matching known aliases.
-
-    Args:
-        entities: Entity list from Pass 2 (modified in place)
-        pass1_result: Pass 1 results
-    """
     for entity in entities:
         if entity.get("canonical"):
             continue
@@ -219,6 +363,16 @@ def _link_aliases(entities: list[dict], pass1_result: dict):
                 break
 
 
+def _is_role_label(text: str) -> bool:
+    """Check if text is a structural role label that should NOT be anonymized."""
+    text_stripped = text.strip()
+    if text_stripped in ROLE_LABELS:
+        return True
+    if text_stripped.lower() in {r.lower() for r in ROLE_LABELS}:
+        return True
+    return False
+
+
 # ============================================================
 # Execute replacement: generate anonymized text + mapping table
 # ============================================================
@@ -231,15 +385,15 @@ def execute_replacement(
     """
     Execute anonymization: replace sensitive items with placeholders.
 
-    Args:
-        text: Original document text
-        entities: Full entity list (from Pass 2, possibly user-edited)
-        pass1_result: Pass 1 results (with alias info)
-        source_filename: Original filename
-
-    Returns:
-        (anonymized_text, mapping_dict)
+    Key design decision: role labels are NOT replaced. They are structural
+    contract elements, not PII. Only actual sensitive values are replaced.
     """
+    alias_role_labels = set()
+    for alias_group in pass1_result.get("aliases", []):
+        for alias in alias_group.get("aliases", []):
+            if _is_role_label(alias):
+                alias_role_labels.add(alias)
+
     # Step 1: Assign placeholders grouped by canonical entity
     canonical_groups = {}
 
@@ -251,26 +405,29 @@ def execute_replacement(
         if not entity_text:
             continue
 
+        if _is_role_label(entity_text):
+            logger.debug("Skipping role label: %s", entity_text)
+            continue
+
         group_key = canonical if canonical else entity_text
 
         if group_key not in canonical_groups:
             canonical_groups[group_key] = {
                 "type": entity_type,
                 "texts": set(),
-                "aliases": [],
             }
 
         canonical_groups[group_key]["texts"].add(entity_text)
-        if canonical:
+        if canonical and not _is_role_label(canonical):
             canonical_groups[group_key]["texts"].add(canonical)
 
-    # Add aliases from Pass 1
+    # Add ONLY non-role-label aliases from Pass 1
     for alias_group in pass1_result.get("aliases", []):
         canonical = alias_group.get("canonical", "")
         if canonical in canonical_groups:
             for alias in alias_group.get("aliases", []):
-                canonical_groups[canonical]["texts"].add(alias)
-                canonical_groups[canonical]["aliases"].append(alias)
+                if not _is_role_label(alias):
+                    canonical_groups[canonical]["texts"].add(alias)
 
     # Assign numbered placeholders per type
     type_counters = {}
@@ -287,13 +444,15 @@ def execute_replacement(
 
         placeholder = "{" + f"{entity_type}_{type_counters[entity_type]}" + "}"
 
+        replaceable_texts = {t for t in group_info["texts"] if not _is_role_label(t)}
+
         placeholder_map[placeholder] = {
             "value": canonical,
             "type": group_info["type"],
-            "aliases": list(group_info["texts"] - {canonical}),
+            "aliases": list(replaceable_texts - {canonical}),
         }
 
-        for t in group_info["texts"]:
+        for t in replaceable_texts:
             text_to_placeholder[t] = placeholder
 
     # Step 2: Replace longest-first to avoid substring conflicts
@@ -331,6 +490,44 @@ def execute_replacement(
             )
 
             search_start = pos + len(placeholder)
+
+    # Step 2b: Whitespace-normalized replacement pass
+    # Catches entities split across lines (e.g., "CareCloud,\nInc." or "A.\n Hadi Chaudhry")
+    for entity_text in sorted_texts:
+        if len(entity_text) < 4:
+            continue
+        placeholder = text_to_placeholder[entity_text]
+        # Build a regex that treats any whitespace in the entity as flexible whitespace
+        words = entity_text.split()
+        if len(words) < 2:
+            continue
+        # Escape each word for regex, join with flexible whitespace pattern
+        flex_pattern = r'[\s]+'.join(re.escape(w) for w in words)
+        try:
+            replaced = True
+            while replaced:
+                replaced = False
+                for m in re.finditer(flex_pattern, anonymized_text):
+                    matched_text = m.group(0)
+                    # Skip if this is already a placeholder or exact match (already handled)
+                    if '{' in matched_text or matched_text == entity_text:
+                        continue
+                    replacement_log.append({
+                        "placeholder": placeholder,
+                        "original_text": matched_text,
+                        "position": m.start(),
+                        "context_before": anonymized_text[max(0, m.start() - 40):m.start()],
+                        "context_after": anonymized_text[m.end():m.end() + 40],
+                    })
+                    anonymized_text = (
+                        anonymized_text[:m.start()]
+                        + placeholder
+                        + anonymized_text[m.end():]
+                    )
+                    replaced = True
+                    break  # Restart finditer since positions shifted
+        except re.error:
+            continue
 
     # Step 3: Assemble mapping table
     mapping = {

@@ -1,5 +1,5 @@
 """
-File handler — reads/writes txt/doc/docx files and mapping JSON files.
+File handler — reads/writes txt/doc/docx/pdf files and mapping JSON files.
 Supports same-format output: input DOCX -> output DOCX, etc.
 Processes headers, footers, tables, and document properties.
 
@@ -16,7 +16,7 @@ from docx import Document
 
 def read_file(file_path: str) -> str:
     """
-    Read file content from disk. Supports .txt / .doc / .docx.
+    Read file content from disk. Supports .txt / .doc / .docx / .pdf.
 
     Args:
         file_path: Path to the file
@@ -26,7 +26,9 @@ def read_file(file_path: str) -> str:
     """
     filename = file_path.lower()
 
-    if filename.endswith(".docx"):
+    if filename.endswith(".pdf"):
+        return _read_pdf(file_path)
+    elif filename.endswith(".docx"):
         return _read_docx(file_path)
     elif filename.endswith(".doc"):
         return _read_doc(file_path)
@@ -83,6 +85,27 @@ def _read_doc(file_path: str) -> str:
     finally:
         if os.path.exists(tmp_txt_path):
             os.unlink(tmp_txt_path)
+
+
+def _read_pdf(file_path: str) -> str:
+    """Read a PDF file using pymupdf. Extracts text from all pages."""
+    import fitz  # pymupdf
+
+    doc = fitz.open(file_path)
+    pages = []
+    for page in doc:
+        text = page.get_text()
+        if text.strip():
+            pages.append(text)
+    doc.close()
+
+    if not pages:
+        raise ValueError(
+            f"No text extracted from PDF: {file_path}. "
+            "The PDF may be scanned/image-based and requires OCR."
+        )
+
+    return "\n".join(pages)
 
 
 # ============================================================

@@ -6,6 +6,15 @@ This repository provides an open-source, self-hosted workflow that lets lawyers 
 
 Two deployment versions are included: a **Maximum Security** version that runs entirely on local hardware, and a **Standard** version that uses cloud APIs to orchestrate local anonymization. Both achieve the same result: **real client data never reaches third-party AI services**.
 
+## NEW: Fine-Tuned LDA Model
+
+We fine-tuned [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) specifically for legal document anonymization, drafting, and agentic reasoning tasks. The fine-tuned model scores **30/30 on our benchmark** (perfect across all tests), outperforming the base model on complex multi-entity anonymization.
+
+- **Model:** [Reytian/qwen3.5-legal-q5_k_m-gguf](https://huggingface.co/Reytian/qwen3.5-legal-q5_k_m-gguf) (GGUF, Q5_K_M, ~24GB)
+- **Training:** 4-bit LoRA via Unsloth, 117 examples (59 LDA + 23 drafting + 26 reasoning + 9 instruction)
+- **Runs on:** Mac Mini M4 Pro (32GB+), ~15.8 tokens/sec, 26GB RAM
+- **Details:** See [`finetune/README.md`](finetune/README.md) and [`benchmark/`](benchmark/)
+
 ---
 
 ## Table of Contents
@@ -18,7 +27,9 @@ Two deployment versions are included: a **Maximum Security** version that runs e
 - [What's Included](#whats-included)
 - [Quick Start](#quick-start)
 - [How the Anonymizer Works](#how-the-anonymizer-works)
+- [Batch Processing Pipeline](#batch-processing-pipeline)
 - [Client Memory System](#client-memory-system)
+- [Fine-Tuning Your Own Model](#fine-tuning-your-own-model)
 - [Supported File Types](#supported-file-types)
 - [Ethics & Compliance](#ethics--compliance)
 - [License](#license)
@@ -78,23 +89,23 @@ This approach satisfies every requirement of Formal Opinion 512:
 
 ```
 User sends document + instructions
-    ↓
-Local Agent (Counsel) classifies the request
-    ├─ Contains client data? → Anonymize locally → Cloud AI edits → Deanonymize locally → User
-    ├─ Fill client info?     → Load client memory (LOCAL only) → Populate template → User
-    ├─ Non-sensitive task?   → Delegate to cloud AI directly → User
-    └─ Simple question?      → Answer locally → User
+    |
+Local Agent classifies the request
+    |-- Contains client data? -> Anonymize locally -> Cloud AI edits -> Deanonymize locally -> User
+    |-- Fill client info?     -> Load client memory (LOCAL only) -> Populate template -> User
+    |-- Non-sensitive task?   -> Delegate to cloud AI directly -> User
+    +-- Simple question?      -> Answer locally -> User
 ```
 
 The pipeline for sensitive documents:
 
 ```
 Original Document (with real client data)
-    ↓ [YOUR MACHINE: Local LLM scans and identifies all sensitive entities]
+    | [YOUR MACHINE: Fine-tuned local LLM scans and identifies all sensitive entities]
 Anonymized Document ({COMPANY_1}, {PERSON_1}, etc.) + mapping.json
-    ↓ [CLOUD AI: Sees only placeholders — edits, drafts, revises as instructed]
+    | [CLOUD AI: Sees only placeholders -- edits, drafts, revises as instructed]
 Edited Anonymized Document (new clauses added, placeholders preserved)
-    ↓ [YOUR MACHINE: Deterministic deanonymization restores real data]
+    | [YOUR MACHINE: Deterministic deanonymization restores real data]
 Final Document (real client data restored, AI edits applied)
 ```
 
@@ -106,7 +117,7 @@ Final Document (real client data restored, AI edits applied)
 
 **For lawyers who want zero cloud dependency for sensitive operations.**
 
-In this version, a local LLM runs on your own hardware (e.g., a Mac Mini with Apple Silicon). It handles:
+In this version, a fine-tuned local LLM runs on your own hardware (e.g., a Mac Mini with Apple Silicon). It handles:
 - Request classification and routing
 - Document anonymization (2-pass entity extraction)
 - Client memory management (loading/populating client details)
@@ -118,35 +129,35 @@ Only the anonymized document is sent to a consumer AI app (Claude Code, ChatGPT,
 
 ```
                         YOUR MACHINE (Mac Mini / MacBook)
-┌──────────────────────────────────────────────────────────────────┐
-│                                                                  │
-│  User ──→ Counsel Agent (local Ollama, e.g. Qwen3 30B)          │
-│              │                                                   │
-│              ├─→ LDA Anonymizer (local LLM) ──→ anonymized.txt   │
-│              │                                   + mapping.json  │
-│              │                                        │          │
-│              │         ┌──────────────────────────────────────┐   │
-│              │         │  CLOUD (consumer AI app)             │   │
-│              │         │  Sees ONLY: {COMPANY_1}, {PERSON_1}  │   │
-│              │         │  Returns: edited anonymized text      │   │
-│              │         └──────────────────────────────────────┘   │
-│              │                                        │          │
-│              ├─→ LDA Deanonymizer (deterministic) ←───┘          │
-│              │         → restored document with real data        │
-│              │                                                   │
-│              ├─→ Client Memory (clients/*.yaml) ──→ LOCAL only   │
-│              │                                                   │
-│              └─→ Non-sensitive tasks ──→ Cloud AI pass-through   │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
++------------------------------------------------------------------+
+|                                                                  |
+|  User --> Agent (local Ollama, fine-tuned Qwen3.5-Legal)         |
+|              |                                                   |
+|              +--> LDA Anonymizer (local LLM) --> anonymized.txt  |
+|              |                                   + mapping.json  |
+|              |                                        |          |
+|              |         +------------------------------+------+   |
+|              |         |  CLOUD (consumer AI app)             |   |
+|              |         |  Sees ONLY: {COMPANY_1}, {PERSON_1}  |   |
+|              |         |  Returns: edited anonymized text      |   |
+|              |         +------------------------------+------+   |
+|              |                                        |          |
+|              +--> LDA Deanonymizer (deterministic) <--+          |
+|              |         -> restored document with real data       |
+|              |                                                   |
+|              +--> Client Memory (clients/*.yaml) --> LOCAL only  |
+|              |                                                   |
+|              +--> Non-sensitive tasks --> Cloud AI pass-through   |
+|                                                                  |
++------------------------------------------------------------------+
 ```
 
 ### Requirements
 
 | Component | Specification |
 |-----------|---------------|
-| Hardware | Mac with Apple Silicon (M1+), 32GB RAM recommended |
-| Local LLM | [Ollama](https://ollama.ai/) + `qwen3:30b-a3b` (~18GB) |
+| Hardware | Mac with Apple Silicon (M1+), 32GB+ RAM |
+| Local LLM | [Ollama](https://ollama.ai/) + fine-tuned `qwen3.5-legal` (~24GB) or base `qwen3.5:35b-a3b` (~23GB) |
 | Python | 3.13+ with `requests`, `python-docx` |
 | Consumer AI | [Claude Code CLI](https://claude.ai/code), ChatGPT, or any AI editor |
 | Orchestrator | [OpenClaw](https://openclaw.ai/) (optional, for agent automation) |
@@ -174,22 +185,22 @@ The key difference from Version 1: the orchestrating agent itself runs in the cl
 ### Architecture
 
 ```
-User ──→ Cloud Agent (Kimi / Claude API)
-            │
-            ├─ "Anonymize this document"
-            │     ↓
-            │   YOUR MACHINE: LDA anonymizer (local Ollama)
-            │     → anonymized.txt + mapping.json (stays local)
-            │     ↓
-            ├─ Cloud Agent receives anonymized text only
-            │     → edits / drafts / revises
-            │     ↓
-            ├─ "Deanonymize the result"
-            │     ↓
-            │   YOUR MACHINE: LDA deanonymizer (deterministic)
-            │     → restored document
-            │     ↓
-            └─ User receives final document
+User --> Cloud Agent (Kimi / Claude API)
+            |
+            +-- "Anonymize this document"
+            |     |
+            |   YOUR MACHINE: LDA anonymizer (local Ollama)
+            |     -> anonymized.txt + mapping.json (stays local)
+            |     |
+            +-- Cloud Agent receives anonymized text only
+            |     -> edits / drafts / revises
+            |     |
+            +-- "Deanonymize the result"
+            |     |
+            |   YOUR MACHINE: LDA deanonymizer (deterministic)
+            |     -> restored document
+            |     |
+            +-- User receives final document
 ```
 
 ### Requirements
@@ -197,7 +208,7 @@ User ──→ Cloud Agent (Kimi / Claude API)
 | Component | Specification |
 |-----------|---------------|
 | Hardware | Mac with Apple Silicon (M1+), 16GB+ RAM |
-| Local LLM | [Ollama](https://ollama.ai/) + `qwen3:30b-a3b` (for anonymization only) |
+| Local LLM | [Ollama](https://ollama.ai/) + `qwen3.5-legal` or `qwen3.5:35b-a3b` (for anonymization only) |
 | Python | 3.13+ with `requests`, `python-docx` |
 | Cloud Agent API | Kimi K2.5 (free tier available), Claude API, or OpenAI API |
 | Consumer AI | Claude Code CLI, ChatGPT, or any AI editor |
@@ -233,9 +244,10 @@ User ──→ Cloud Agent (Kimi / Claude API)
 | **Setup time** | 1-2 hours (install Ollama, clone repo, configure) | Weeks-months (enterprise sales, demos, implementation) |
 | **Confidentiality approach** | Client data never leaves your machine (anonymize-before-transmit) | Enterprise data agreements, SOC 2 compliance, contractual guarantees |
 | **Rule 1.6 compliance** | Structural (data never transmitted) | Contractual (data transmitted under NDA/DPA) |
+| **Model** | Fine-tuned Qwen3.5-Legal (open weights, 30/30 benchmark) | Harvey's proprietary fine-tuned models (OpenAI-based) |
 | **Customization** | Full control — edit prompts, models, skills, client memory | Limited to Harvey's feature set and configuration options |
 | **Client memory** | Per-client YAML files with entity details, preferences, banking info | Firm-wide knowledge base (Harvey's "vault") |
-| **Model choice** | Any model — local (Ollama), Claude, GPT, Kimi, open-source | Harvey's proprietary fine-tuned models (OpenAI-based) |
+| **Model choice** | Any model — local (Ollama), Claude, GPT, Kimi, open-source | Harvey's proprietary fine-tuned models |
 | **Bilingual support** | Built-in (tested with Chinese/English cross-border contracts) | English-primary; limited multilingual support |
 | **Offline capability** | Full (Version 1); partial (Version 2) | None (cloud-only) |
 | **Open source** | Yes (MIT license) | No (proprietary) |
@@ -261,6 +273,34 @@ This makes it particularly suitable for:
 
 ```
 ├── README.md                          # This file
+├── lda/
+│   ├── lda_cli.py                     # CLI entry point (anonymize / deanonymize)
+│   ├── lda_batch.py                   # Batch processing pipeline (submit/status/result)
+│   ├── mcp_server.py                  # MCP server for agent integration
+│   ├── file_watcher.py                # Auto-intercepts inbound files for processing
+│   ├── lda_autopipeline.py            # Auto-pipeline: detect → CC draft → deanonymize → deliver
+│   ├── save_batch_meta.py             # Batch metadata and cross-batch grouping
+│   ├── core/
+│   │   ├── anonymizer.py              # 2-pass LLM anonymization engine
+│   │   ├── deanonymizer.py            # 3-step deterministic restoration
+│   │   ├── file_handler.py            # .txt/.doc/.docx file I/O
+│   │   ├── llm_client.py              # Ollama API client
+│   │   ├── prompts.py                 # English prompts for bilingual docs
+│   │   └── section_detector.py        # Key section extraction
+│   └── tests/
+│       └── sample_contract.txt        # Sample bilingual contract for testing
+├── finetune/
+│   ├── README.md                      # Fine-tuning pipeline documentation
+│   ├── Modelfile                      # Ollama Modelfile template for fine-tuned GGUF
+│   ├── unsloth_finetune.ipynb         # Training notebook (RunPod / Colab)
+│   ├── lora_config.yaml               # LoRA configuration
+│   └── scripts/
+│       ├── prepare_lda_dataset.py     # Generate LDA training pairs from EDGAR docs
+│       ├── prepare_drafting_dataset.py # Generate drafting training examples
+│       └── merge_and_split.py         # Merge datasets → train/valid split
+├── benchmark/
+│   ├── qwen35-benchmark-results.md    # Full benchmark report
+│   └── run_benchmark_v2.sh            # Automated benchmark runner
 ├── openclaw-config/
 │   ├── openclaw-legal-agent.json      # Agent config (local-first model)
 │   └── openclaw-providers.json        # Provider templates (add your API keys)
@@ -273,22 +313,11 @@ This makes it particularly suitable for:
 │   └── clients/
 │       ├── _template.yaml             # Blank client memory template
 │       └── sample-globalventures.yaml # Sample client (fictional data)
-├── skills/
-│   ├── client-memory/SKILL.md         # Per-client memory management
-│   ├── legal-doc-anonymizer/SKILL.md  # Sensitive doc pipeline
-│   ├── cloud-pass-through/SKILL.md    # Non-sensitive delegation
-│   └── skill-creator/SKILL.md         # Skill creation via cloud AI
-└── lda/
-    ├── lda_cli.py                     # CLI entry point
-    ├── core/
-    │   ├── anonymizer.py              # 2-pass LLM anonymization engine
-    │   ├── deanonymizer.py            # 3-step deterministic restoration
-    │   ├── file_handler.py            # .txt/.doc/.docx file I/O
-    │   ├── llm_client.py              # Ollama API client
-    │   ├── prompts.py                 # English prompts for bilingual docs
-    │   └── section_detector.py        # Key section extraction
-    └── tests/
-        └── sample_contract.txt        # Sample bilingual contract for testing
+└── skills/
+    ├── client-memory/SKILL.md         # Per-client memory management
+    ├── legal-doc-anonymizer/SKILL.md  # Sensitive doc pipeline
+    ├── cloud-pass-through/SKILL.md    # Non-sensitive delegation
+    └── skill-creator/SKILL.md         # Skill creation via cloud AI
 ```
 
 ---
@@ -300,7 +329,14 @@ This makes it particularly suitable for:
 ```bash
 # Install Ollama (macOS)
 brew install ollama
-ollama pull qwen3:30b-a3b
+
+# Option A: Use the fine-tuned model (recommended, better LDA performance)
+# Download from HuggingFace: https://huggingface.co/Reytian/qwen3.5-legal-q5_k_m-gguf
+# Then create with the included Modelfile:
+ollama create qwen3.5-legal -f finetune/Modelfile
+
+# Option B: Use the base model
+ollama pull qwen3.5:35b-a3b
 ```
 
 ### 2. Set Up LDA Tool
@@ -367,19 +403,53 @@ Scans every segment of the document, using Pass 1 context to catch:
 
 ---
 
+## Batch Processing Pipeline
+
+The LDA batch processor handles multi-document workflows with automatic drafting and delivery.
+
+### Components
+
+- **`lda_batch.py`** — Batch job manager: submit documents, track status, retrieve results
+- **`lda_autopipeline.py`** — Automated pipeline: detects completed anonymization, runs Cloud AI drafting, deanonymizes, formats .docx, delivers via Signal
+- **`file_watcher.py`** — File system watcher: auto-intercepts inbound documents for processing
+- **`mcp_server.py`** — MCP server: exposes batch tools to AI agents (submit, status, results, retry, cache)
+- **`save_batch_meta.py`** — Batch metadata: saves instructions and supports cross-batch grouping for unified memos
+
+### Batch Commands
+
+```bash
+# Submit a document or directory
+python lda_batch.py submit /path/to/document.docx
+
+# Check status
+python lda_batch.py status <batch_id>
+
+# Get results
+python lda_batch.py result <batch_id>
+
+# Cross-batch grouping (multiple docs into one memo)
+python save_batch_meta.py BATCH1 "Draft an office memo" --related BATCH2 BATCH3
+```
+
+### Content Cache
+
+The batch processor includes SHA-256 hash-based deduplication. Documents that have already been anonymized are served from cache, avoiding redundant LLM calls.
+
+---
+
 ## Client Memory System
 
-Per-client memory files store entity details, contacts, preferences, and active matters in YAML format. These files are **Counsel-exclusive** — no other agent may access them, and they are never transmitted to cloud AI.
+Per-client memory files store entity details, contacts, preferences, and active matters in YAML format. These files are **agent-exclusive** — no other agent may access them, and they are never transmitted to cloud AI.
 
 ### How It Works
 
 ```
 User: "This is Global Ventures' file. Fill in their information."
-  → Counsel identifies client slug ("global-ventures")
-  → Loads clients/global-ventures.yaml (~2KB)
-  → Reads the contract template
-  → Fills in client details using LOCAL model only
-  → Returns populated contract — no cloud AI touched client PII
+  -> Agent identifies client slug ("global-ventures")
+  -> Loads clients/global-ventures.yaml (~2KB)
+  -> Reads the contract template
+  -> Fills in client details using LOCAL model only
+  -> Returns populated contract -- no cloud AI touched client PII
 ```
 
 ### Client File Format (YAML)
@@ -395,18 +465,18 @@ Each client file contains:
 
 See `workspace-legal/clients/_template.yaml` for the full schema and `sample-globalventures.yaml` for a working example.
 
-### Access Control (3 layers)
+---
 
-1. **Structural**: Client files live in Counsel's workspace only (`workspace-legal/clients/`)
-2. **Counsel's instructions**: SOUL.md, AGENTS.md, and SKILL.md all prohibit sharing client PII with other agents, cloud AI, or shared memory
-3. **Other agents' instructions**: Other agents' configurations mark `workspace-legal/clients/` as off-limits
+## Fine-Tuning Your Own Model
 
-### Local Model Performance
+See [`finetune/README.md`](finetune/README.md) for the complete pipeline:
 
-Tested with Qwen3 30B on Mac Mini M4 (32GB):
-- **Full template fill** (8+ fields including bilingual Chinese/English): 100% accuracy, ~60s
-- **Targeted extraction** (3-4 fields): 100% accuracy, ~12s
-- **Zero hallucinations** across all tests
+1. Collect legal documents (we used SEC EDGAR public filings)
+2. Generate training pairs using the included scripts
+3. Fine-tune with Unsloth on a GPU (RunPod RTX PRO 6000 recommended)
+4. Export to GGUF and deploy via Ollama
+
+The fine-tuned model improves LDA efficiency (less thinking overhead, more direct output) and handles complex multi-entity documents that base models struggle with.
 
 ---
 
@@ -417,6 +487,8 @@ Tested with Qwen3 30B on Mac Mini M4 (32GB):
 | `.txt` | Yes | Yes | UTF-8/GBK auto-detection |
 | `.docx` | Yes | Yes | Preserves formatting via python-docx |
 | `.doc` | Yes | Yes | Via macOS `textutil` conversion |
+| `.pdf` | Yes | No | Text extraction for anonymization |
+| `.zip` | Yes | N/A | Auto-extract and process contents |
 
 ---
 

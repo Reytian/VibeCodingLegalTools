@@ -2,98 +2,109 @@
 LLM API client — calls local Ollama via native /api/chat endpoint.
 Hardcoded for local deployment: no .env, no external API keys.
 
-Uses native Ollama API for better control over context window,
-generation parameters, and thinking mode.
+Uses Qwen3.5 35B (A3B) for high-quality entity extraction.
+Uses Ollama's format=json for guaranteed valid JSON output.
 """
 
+import os
 import re
 import json
+import time
 import logging
 import requests
 
 logger = logging.getLogger(__name__)
 
 OLLAMA_BASE = "http://localhost:11434"
-LLM_MODEL = "qwen3:30b-a3b"
+LLM_MODEL = os.environ.get("LDA_MODEL", "qwen3.5:35b-a3b")
 
 SYSTEM_MSG = (
     "You are a precise legal document analysis assistant. "
     "Always return valid JSON as requested. "
-    "Never wrap JSON in markdown code fences. "
-    "Do not include any text outside the JSON structure."
+    "Never include any text outside the JSON structure."
 )
+
+# Retry config for transient Ollama errors (model swapping, etc.)
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2  # seconds
 
 
 def call_llm(messages: list[dict], temperature: float = 0.1) -> str:
     """
     Call the local Ollama LLM via native API and return the text response.
 
-    Appends /no_think to user messages to disable Qwen3's thinking mode.
+    Uses format=json to guarantee structured output and prevent
+    thinking mode from consuming the generation budget.
+    Retries up to 3 times with exponential backoff for transient errors.
 
     Args:
         messages: Chat messages list [{"role": "...", "content": "..."}, ...]
         temperature: Generation temperature (default 0.1 for deterministic extraction)
 
     Returns:
-        LLM text response (with <think> blocks stripped)
+        LLM text response (guaranteed valid JSON string)
     """
-    # Add system message and append /no_think to user messages
     processed = [{"role": "system", "content": SYSTEM_MSG}]
     for msg in messages:
-        if msg["role"] == "user":
-            processed.append({
-                "role": "user",
-                "content": msg["content"] + "\n/no_think",
-            })
-        else:
-            processed.append(msg)
+        processed.append(msg)
 
     body = {
         "model": LLM_MODEL,
         "messages": processed,
         "stream": False,
+        "format": "json",
+        "think": False,
         "options": {
             "temperature": temperature,
-            "num_ctx": 16384,
+            "num_ctx": 32768,
             "num_predict": 4096,
         },
     }
 
-    logger.debug("Calling LLM with %d messages", len(messages))
+    logger.debug("Calling LLM (%s) with %d messages", LLM_MODEL, len(messages))
 
-    response = requests.post(
-        f"{OLLAMA_BASE}/api/chat",
-        json=body,
-        timeout=600,
-    )
-    response.raise_for_status()
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                f"{OLLAMA_BASE}/api/chat",
+                json=body,
+                timeout=300,
+            )
+            response.raise_for_status()
 
-    result = response.json()
-    content = result.get("message", {}).get("content", "")
+            result = response.json()
+            content = result.get("message", {}).get("content", "")
 
-    duration_s = result.get("total_duration", 0) / 1e9
-    logger.info("LLM response in %.1fs (%d chars)", duration_s, len(content))
+            duration_s = result.get("total_duration", 0) / 1e9
+            logger.info("LLM response in %.1fs (%d chars)", duration_s, len(content))
 
-    # Strip Qwen3 <think>...</think> blocks (in case they still appear)
-    content = _strip_think_blocks(content)
+            if not content:
+                logger.warning("LLM returned empty content. Raw response keys: %s", list(result.keys()))
 
-    if not content:
-        logger.warning("LLM returned empty content. Raw response keys: %s", list(result.keys()))
+            return content
 
-    return content
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    "LLM call attempt %d/%d failed (%s), retrying in %ds...",
+                    attempt, MAX_RETRIES, type(e).__name__, delay,
+                )
+                time.sleep(delay)
+            else:
+                logger.error("LLM call failed after %d attempts: %s", MAX_RETRIES, e)
 
-
-def _strip_think_blocks(text: str) -> str:
-    """Remove Qwen3 thinking mode <think>...</think> blocks from response."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    raise last_error
 
 
 def parse_json_response(text: str) -> dict | list:
     """
     Extract JSON data from an LLM response.
 
-    Handles various formats: raw JSON, markdown-wrapped JSON,
-    JSON embedded in explanatory text, and Qwen3 think blocks.
+    With format=json enabled, the response should already be valid JSON.
+    Fallback parsing is kept for robustness.
 
     Args:
         text: Raw LLM response text
@@ -101,14 +112,12 @@ def parse_json_response(text: str) -> dict | list:
     Returns:
         Parsed dict or list
     """
-    # Strip think blocks first
-    text = _strip_think_blocks(text)
-
     try:
         return json.loads(text.strip())
     except json.JSONDecodeError:
         pass
 
+    # Fallback: strip markdown fences
     cleaned = re.sub(r"```(?:json)?\s*", "", text)
     cleaned = cleaned.strip()
     try:
@@ -116,6 +125,7 @@ def parse_json_response(text: str) -> dict | list:
     except json.JSONDecodeError:
         pass
 
+    # Fallback: extract JSON substring
     for start_char, end_char in [("{", "}"), ("[", "]")]:
         start_idx = text.find(start_char)
         if start_idx == -1:

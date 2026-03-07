@@ -1,0 +1,16 @@
+# LoRA config for Qwen3.5:35b-a3b fine-tuning
+# Targets attention + MoE expert layers (NOT the router — that destabilizes routing)
+# MoE expert keys confirmed via mlx-lm GitHub issue #571
+lora_layers: 8
+lora_parameters:
+  rank: 8
+  scale: 20.0
+  dropout: 0.0
+  keys:
+    - "self_attn.q_proj"
+    - "self_attn.v_proj"
+    - "self_attn.k_proj"
+    - "self_attn.o_proj"
+    - "mlp.switch_mlp.gate_proj"
+    - "mlp.switch_mlp.up_proj"
+    - "mlp.switch_mlp.down_proj"

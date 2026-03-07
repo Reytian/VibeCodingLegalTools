@@ -5,74 +5,82 @@ Contains two prompts:
 - PASS1_PROMPT: Extract entity definitions and aliases from key sections
 - PASS2_PROMPT: Identify all sensitive items in each document segment
 
-Prompts are in English and handle bilingual (Chinese/English) legal documents.
+Optimized for small models (Qwen3 4B): concise, no example values to copy,
+explicit verbatim-copy rule.
 """
 
 # ============================================================
 # Pass 1 prompt: extract entity definitions from key contract sections
 # ============================================================
-PASS1_PROMPT = """You are a legal document analysis assistant. Below are key excerpts from a legal contract (including definition clauses, notice clauses, and signature pages). The document may be in English, Chinese, or bilingual.
+PASS1_PROMPT = """Read these legal contract excerpts carefully. Extract ALL sensitive information.
 
-Extract all party and entity definitions, as well as all sensitive information found in these excerpts.
+RULES:
+1. Copy each entity's text EXACTLY from the document — character by character
+2. Do NOT translate (if text is Chinese, keep Chinese; if English, keep English)
+3. Find EVERY entity, not just a few
+4. Return valid JSON only, no other text
 
-What to extract:
-1. Entity definition relationships: which abbreviations/aliases refer to the same entity
-   Examples: "Party A" = "Shanghai Starchen Technology Co., Ltd.", "the Target" = "XYZ Technology Limited"
-2. All sensitive information: personal names, company names, addresses, phone numbers, emails, amounts, etc.
+Entity types to find: person, company, address, phone, email, regnum, bank, amount, date
 
-Also determine the document type (e.g.: Share Purchase Agreement, Employment Agreement, Loan Agreement, NDA, Equity Transfer Agreement, etc.) — use a concise English label.
-
-Return ONLY valid JSON, no markdown fencing, no other text:
+Return format:
 {{
-  "document_type": "Equity Transfer Agreement",
+  "document_type": "<type in English>",
   "aliases": [
-    {{
-      "canonical": "Shanghai Example Technology Co., Ltd.",
-      "aliases": ["Party A", "Transferor"],
-      "type": "company"
-    }}
+    {{"canonical": "<full formal name copied from text>", "aliases": ["<abbreviation>"], "type": "<type>"}}
   ],
   "entities": [
-    {{"text": "Shanghai Example Technology Co., Ltd.", "type": "company"}},
-    {{"text": "john@example.com", "type": "email"}}
+    {{"text": "<exact text from document>", "type": "<type>"}}
   ]
 }}
 
+The "entities" array must include ALL of these found in the text:
+- Every person name (Chinese and English) — including names in signature blocks near "/s/" markers
+- Every company/organization name (Chinese and English) — including names in document headers, titles, and captions
+- Every full street address (e.g. "7 Clyde Road, Somerset New Jersey 08873") — include street number, street name, city, state, and ZIP as ONE entity
+- Every phone number (with country code if present)
+- Every email address
+- Every registration/ID number (USCC, Cayman reg, passport, etc.)
+- Every bank account number
+- Every bank name
+- Every monetary/dollar amount (e.g. "$300,000", "USD 1,000,000.00") — include the currency symbol/code
+
+IMPORTANT — commonly missed items:
+- Person names that appear BELOW "/s/" signature lines (formatted name after the signature marker)
+- Company names in document headers or title lines (first few lines of the document)
+- Full US street addresses with ZIP codes
+- Dollar amounts like "$300,000" or "$1,500,000.00"
+
 ---
-Key contract excerpts:
+Contract excerpts:
 {key_sections_text}"""
 
 # ============================================================
 # Pass 2 prompt: identify all sensitive items per document segment
 # ============================================================
-PASS2_PROMPT = """You are a legal document anonymization assistant. Carefully read the following legal document segment and identify ALL sensitive information. The document may be in English, Chinese, or bilingual.
+PASS2_PROMPT = """Read this legal document segment. Find ALL sensitive information not yet found.
 
-[Known Entity Definitions (from contract definition clauses)]
+Known entities already found:
 {entity_aliases_context}
 
-Based on the above definitions, abbreviations like "Party A", "Target Company" (or their Chinese equivalents) should also be treated as sensitive information.
+Find any ADDITIONAL sensitive items in this segment. Types: person, company, address, phone, email, regnum, bank, amount, date.
 
-Sensitive information includes but is not limited to:
-- Personal names (Chinese and English)
-- Company/organization names (Chinese and English, including abbreviations/aliases from definitions above)
-- Monetary amounts (numbers with currency symbols)
-- Phone numbers, fax numbers
-- Email addresses
-- ID numbers: national ID, passport, SSN, EIN
-- Bank account numbers
-- Cryptocurrency wallet addresses
-- Physical addresses (street-level)
-- Company registration numbers (including Unified Social Credit Code, Cayman/BVI registration numbers)
-- Specific dates (contract signing dates, deadlines — NOT general legal effective dates)
+Pay special attention to:
+- Person names near "/s/" signature markers (the formatted name below the signature line)
+- Company names in headers, titles, or captions
+- Full street addresses (street + city + state + ZIP)
+- Dollar amounts ("$300,000", "$1,500,000.00")
 
-Return ONLY a valid JSON array, no markdown fencing, no other text:
+RULES:
+1. Copy text EXACTLY from the document — do NOT translate
+2. Only include items NOT already in the known entities list above
+3. Return valid JSON array only, no other text
+
+Return format:
 [
-  {{
-    "text": "Sensitive information as it appears in the original text",
-    "type": "person/company/amount/phone/email/id/bank/wallet/address/regnum/date",
-    "canonical": "If this is a known alias of an entity, put the formal name here; otherwise empty string"
-  }}
+  {{"text": "<exact text from document>", "type": "<type>", "canonical": ""}}
 ]
+
+If no new entities found, return: []
 
 ---
 Document segment:
