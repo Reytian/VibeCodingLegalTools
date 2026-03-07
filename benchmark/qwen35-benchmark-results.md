@@ -1,7 +1,7 @@
 # Qwen3.5-35B-A3B Model Benchmark Results
 
 **Date:** 2026-03-07
-**Hardware:** Mac Mini M4 Pro, 64GB RAM
+**Hardware:** Mac Mini M4 Pro, 32GB RAM
 
 Comparing fine-tuned (Unsloth 4-bit LoRA, RunPod RTX PRO 6000, 45 steps, loss 1.34) vs base Qwen3.5-35B-A3B across LDA, Legal Drafting, and Agentic reasoning tasks.
 
@@ -126,7 +126,7 @@ PARAMETER num_ctx 8192
 
 ## Test Setup
 
-- **Hardware:** Mac Mini M4 Pro, 64GB RAM
+- **Hardware:** Mac Mini M4 Pro, 32GB RAM
 - **Ollama:** v0.17.7 (brew, upgraded from 0.17.1-rc1)
 - **MLX:** v0.31.0, mlx-lm v0.31.0 (Python 3.14 venv)
 - **Fine-tune:** Unsloth 4-bit LoRA, RunPod RTX PRO 6000 96GB, 45 steps (3 epochs)
