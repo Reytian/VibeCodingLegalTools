@@ -55,7 +55,49 @@ Upload `unsloth_finetune.ipynb` to RunPod with an RTX PRO 6000 (96GB VRAM). The 
 - Trains for 3 epochs on the 117-example dataset
 - Exports to GGUF Q5_K_M format
 
-### 4. Deployment (Ollama)
+### 4. Deployment
+
+There are two inference backends. Both use the same fine-tuned model weights.
+
+#### Option A: MLX (Recommended for Mac)
+
+MLX is Apple's native ML framework. On Apple Silicon, it is ~2x faster than Ollama with better JSON reliability — recommended for all Mac users.
+
+```bash
+# Create a Python venv with mlx-lm
+python3 -m venv mlx-env
+source mlx-env/bin/activate
+pip install mlx-lm
+
+# Convert fine-tuned model to MLX 4-bit format (~16GB on disk)
+python3 -m mlx_lm.convert \
+  --hf-path Reytian/qwen3.5-legal-q5_k_m-gguf \
+  --mlx-path ./mlx-legal \
+  --quantize --q-bits 4
+
+# Start the MLX server (OpenAI-compatible API)
+python3 -m mlx_lm.server --model ./mlx-legal --port 8801
+```
+
+The LDA pipeline auto-detects MLX at `http://127.0.0.1:8801`. To use it:
+```bash
+# Auto mode (MLX first, Ollama fallback) — this is the default
+export LDA_BACKEND=auto
+
+# Force MLX only
+export LDA_BACKEND=mlx
+
+# Force Ollama only
+export LDA_BACKEND=ollama
+```
+
+**Note:** MLX returns thinking tokens in the content field (no separate reasoning field). The LDA client automatically strips `<think>...</think>` tags from responses.
+
+**Note on quantization:** Qwen3.5's MoE architecture (128 experts) means expert FFN layers are always quantized at 4-bit by `mlx_lm`, regardless of the `--q-bits` flag. The effective bits/weight is ~4.5 even with `--q-bits 6`. This is a limitation of the current MLX quantizer for MoE models, not a bug. On 32GB RAM, 4-bit is the practical ceiling.
+
+#### Option B: Ollama (Cross-Platform)
+
+Ollama works on macOS, Linux, and Windows. Use this if you're not on Apple Silicon or prefer Ollama's ecosystem.
 
 ```bash
 # Download GGUF to your machine
@@ -94,16 +136,26 @@ The fine-tuning made the model more **efficient** at LDA tasks — less thinking
 
 ### Performance
 
-- **Speed:** ~15.8 tokens/second (Ollama, Mac Mini M4 Pro)
-- **Memory:** 26 GB RAM (97% GPU / 3% CPU offload)
-- **Context:** 8192 tokens
+#### Backend Comparison (Mac Mini M4 Pro, 32GB RAM)
+
+| Backend | Avg Speed | Avg Latency (10KB) | JSON Reliability | RAM Usage |
+|---------|-----------|---------------------|-------------------|-----------|
+| **MLX 4-bit** | **30.5 t/s** | **~16s** | **97% (68/70)** | ~16GB |
+| Ollama Q5_K_M | 15.8 t/s | ~68s | 56% (39/70) | ~26GB |
+
+MLX is 2x faster with 4.8x lower latency. The JSON reliability difference comes from MLX's cleaner handling of the model's thinking token architecture. Both backends use the same model weights — the performance gap is purely from the inference runtime.
+
+**Important:** MLX and Ollama cannot run simultaneously on 32GB RAM (16GB + 26GB = 42GB). Choose one as your primary backend. With `LDA_BACKEND=auto` (default), the pipeline tries MLX first and falls back to Ollama only if MLX is unavailable.
+
+Full benchmark script: [`benchmark/benchmark_ollama_vs_mlx.py`](../benchmark/benchmark_ollama_vs_mlx.py)
 
 ## Hardware Requirements
 
 | Use Case | Hardware | Notes |
 |----------|----------|-------|
-| **Inference (Q5_K_M)** | Apple Silicon Mac, 32GB+ RAM | 26GB for model, leaves headroom for OS |
-| **Inference (Q4_K_M)** | Apple Silicon Mac, 32GB RAM | 20GB for model |
+| **Inference (MLX 4-bit)** | Apple Silicon Mac, 32GB+ RAM | 16GB for model, best performance |
+| **Inference (Ollama Q5_K_M)** | Apple Silicon Mac, 32GB+ RAM | 26GB for model, cross-platform |
+| **Inference (Ollama Q4_K_M)** | Apple Silicon Mac, 32GB RAM | 20GB for model |
 | **Training** | GPU with 48GB+ VRAM | RTX PRO 6000, A100, etc. |
 
 ## Key Lessons

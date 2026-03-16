@@ -12,8 +12,23 @@ We fine-tuned [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) spe
 
 - **Model:** [Reytian/qwen3.5-legal-q5_k_m-gguf](https://huggingface.co/Reytian/qwen3.5-legal-q5_k_m-gguf) (GGUF, Q5_K_M, ~24GB)
 - **Training:** 4-bit LoRA via Unsloth, 117 examples (59 LDA + 23 drafting + 26 reasoning + 9 instruction)
-- **Runs on:** Mac Mini M4 Pro (32GB+), ~15.8 tokens/sec, 26GB RAM
+- **Runs on:** Mac Mini M4 Pro (32GB+)
 - **Details:** See [`finetune/README.md`](finetune/README.md) and [`benchmark/`](benchmark/)
+
+### Two Inference Backends: MLX (Recommended) and Ollama
+
+The model can run through two backends on Apple Silicon Macs. Both are included in this repository.
+
+| Backend | Speed | Latency (10KB doc) | JSON Reliability | Best For |
+|---------|-------|--------------------|--------------------|----------|
+| **MLX (recommended)** | ~30.5 t/s | ~16s | 68/70 (97%) | Mac users who want maximum performance |
+| Ollama | ~15.8 t/s | ~68s | 39/70 (56%) | Cross-platform, broader hardware support |
+
+**We recommend MLX for Mac users.** It is 2x faster, has 4.8x lower latency, and produces more reliable structured output (JSON). MLX uses Apple's native Metal framework, which is optimized for Apple Silicon's unified memory architecture.
+
+Ollama remains a solid choice for Linux/Windows users or for environments where MLX is unavailable. Both backends use the same fine-tuned model weights — the performance difference comes from the inference runtime, not the model itself.
+
+See [`benchmark/benchmark_ollama_vs_mlx.py`](benchmark/benchmark_ollama_vs_mlx.py) for the full comparison script and [`finetune/README.md`](finetune/README.md) for setup instructions for both backends.
 
 ---
 
@@ -131,7 +146,7 @@ Only the anonymized document is sent to a consumer AI app (Claude Code, ChatGPT,
                         YOUR MACHINE (Mac Mini / MacBook)
 +------------------------------------------------------------------+
 |                                                                  |
-|  User --> Agent (local Ollama, fine-tuned Qwen3.5-Legal)         |
+|  User --> Agent (local MLX or Ollama, fine-tuned Qwen3.5-Legal)  |
 |              |                                                   |
 |              +--> LDA Anonymizer (local LLM) --> anonymized.txt  |
 |              |                                   + mapping.json  |
@@ -157,8 +172,8 @@ Only the anonymized document is sent to a consumer AI app (Claude Code, ChatGPT,
 | Component | Specification |
 |-----------|---------------|
 | Hardware | Mac with Apple Silicon (M1+), 32GB+ RAM |
-| Local LLM | [Ollama](https://ollama.ai/) + fine-tuned `qwen3.5-legal` (~24GB) or base `qwen3.5:35b-a3b` (~23GB) |
-| Python | 3.13+ with `requests`, `python-docx` |
+| Local LLM | [MLX](https://github.com/ml-explore/mlx) (recommended for Mac) or [Ollama](https://ollama.ai/) + fine-tuned `qwen3.5-legal` |
+| Python | 3.9+ with `requests`, `python-docx` |
 | Consumer AI | [Claude Code CLI](https://claude.ai/code), ChatGPT, or any AI editor |
 | Orchestrator | [OpenClaw](https://openclaw.ai/) (optional, for agent automation) |
 
@@ -167,7 +182,7 @@ Only the anonymized document is sent to a consumer AI app (Claude Code, ChatGPT,
 | Item | Cost |
 |------|------|
 | Hardware (Mac Mini M4 32GB) | ~$800 one-time |
-| Ollama + local model | Free (open source) |
+| MLX or Ollama + local model | Free (open source) |
 | Claude Code CLI | ~$20/month (Pro plan) |
 | OpenClaw | Free (open source) |
 | **Total ongoing** | **~$20/month** |
@@ -208,8 +223,8 @@ User --> Cloud Agent (Kimi / Claude API)
 | Component | Specification |
 |-----------|---------------|
 | Hardware | Mac with Apple Silicon (M1+), 16GB+ RAM |
-| Local LLM | [Ollama](https://ollama.ai/) + `qwen3.5-legal` or `qwen3.5:35b-a3b` (for anonymization only) |
-| Python | 3.13+ with `requests`, `python-docx` |
+| Local LLM | [MLX](https://github.com/ml-explore/mlx) (recommended for Mac) or [Ollama](https://ollama.ai/) + `qwen3.5-legal` (for anonymization only) |
+| Python | 3.9+ with `requests`, `python-docx` |
 | Cloud Agent API | Kimi K2.5 (free tier available), Claude API, or OpenAI API |
 | Consumer AI | Claude Code CLI, ChatGPT, or any AI editor |
 
@@ -284,9 +299,10 @@ This makes it particularly suitable for:
 │   │   ├── anonymizer.py              # 2-pass LLM anonymization engine
 │   │   ├── deanonymizer.py            # 3-step deterministic restoration
 │   │   ├── file_handler.py            # .txt/.doc/.docx file I/O
-│   │   ├── llm_client.py              # Ollama API client
+│   │   ├── llm_client.py              # MLX + Ollama API client (auto-fallback)
 │   │   ├── prompts.py                 # English prompts for bilingual docs
 │   │   └── section_detector.py        # Key section extraction
+│   │   └── tracked_changes.py         # Word Track Changes generation (OOXML)
 │   └── tests/
 │       └── sample_contract.txt        # Sample bilingual contract for testing
 ├── finetune/
@@ -299,7 +315,8 @@ This makes it particularly suitable for:
 │       ├── prepare_drafting_dataset.py # Generate drafting training examples
 │       └── merge_and_split.py         # Merge datasets → train/valid split
 ├── benchmark/
-│   ├── qwen35-benchmark-results.md    # Full benchmark report
+│   ├── qwen35-benchmark-results.md    # Full benchmark report (model comparison)
+│   ├── benchmark_ollama_vs_mlx.py     # Ollama vs MLX backend benchmark
 │   └── run_benchmark_v2.sh            # Automated benchmark runner
 ├── openclaw-config/
 │   ├── openclaw-legal-agent.json      # Agent config (local-first model)
@@ -324,18 +341,41 @@ This makes it particularly suitable for:
 
 ## Quick Start
 
-### 1. Install Ollama + Model
+### 1. Install Local Model
+
+#### Option A: MLX (Recommended for Mac)
+
+MLX is Apple's native ML framework — 2x faster than Ollama on Apple Silicon.
 
 ```bash
-# Install Ollama (macOS)
-brew install ollama
+# Create a Python venv
+python3 -m venv mlx-env
+source mlx-env/bin/activate
+pip install mlx-lm
 
-# Option A: Use the fine-tuned model (recommended, better LDA performance)
-# Download from HuggingFace: https://huggingface.co/Reytian/qwen3.5-legal-q5_k_m-gguf
-# Then create with the included Modelfile:
+# Convert the fine-tuned model to MLX format (4-bit quantized, ~16GB)
+python3 -m mlx_lm.convert \
+  --hf-path Reytian/qwen3.5-legal-q5_k_m-gguf \
+  --mlx-path ./mlx-legal \
+  --quantize --q-bits 4
+
+# Start the MLX server (OpenAI-compatible API on port 8801)
+python3 -m mlx_lm.server --model ./mlx-legal --port 8801
+```
+
+The LDA pipeline auto-detects MLX on port 8801. Set `LDA_BACKEND=mlx` to force MLX, or `LDA_BACKEND=auto` (default) for MLX-first with Ollama fallback.
+
+#### Option B: Ollama (Cross-Platform)
+
+```bash
+# Install Ollama (macOS/Linux)
+brew install ollama   # or see https://ollama.ai
+
+# Use the fine-tuned model (recommended)
+# Download GGUF from: https://huggingface.co/Reytian/qwen3.5-legal-q5_k_m-gguf
 ollama create qwen3.5-legal -f finetune/Modelfile
 
-# Option B: Use the base model
+# Or use the base model
 ollama pull qwen3.5:35b-a3b
 ```
 

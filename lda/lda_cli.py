@@ -26,7 +26,14 @@ from core.file_handler import (
     apply_replacements_to_docx,
     apply_replacements_to_doc,
 )
-from core.anonymizer import run_first_pass, run_second_pass, execute_replacement
+from core.anonymizer import (
+    run_first_pass,
+    run_second_pass,
+    execute_replacement,
+    run_regex_prefilter,
+    should_skip_pass2,
+    merge_pass1_and_prefilter,
+)
 from core.deanonymizer import run_deanonymize
 
 logging.basicConfig(
@@ -46,20 +53,35 @@ def cmd_anonymize(args):
     text = read_file(input_path)
     logger.info("Document length: %d characters", len(text))
 
-    # Pass 1: entity definitions
-    logger.info("Running Pass 1: entity definition extraction...")
-    pass1_result = run_first_pass(text)
+    # Phase 0: Regex pre-filter — catch structured PII before LLM calls
+    logger.info("Running regex pre-filter...")
+    prefilter_results = run_regex_prefilter(text)
 
-    # Pass 2: full document scan
-    logger.info("Running Pass 2: full document sensitive item scan...")
-    entities = run_second_pass(text, pass1_result)
+    # Pass 1: entity definitions (with pre-filter hints)
+    logger.info("Running Pass 1: entity definition extraction...")
+    pass1_result = run_first_pass(text, prefilter_results=prefilter_results)
+
+    # Pass 2: full document scan (may be skipped for short documents)
+    pass2_skipped = should_skip_pass2(text, pass1_result, prefilter_results)
+    if pass2_skipped:
+        logger.info("Skipping Pass 2 — merging Pass 1 + pre-filter results")
+        entities = merge_pass1_and_prefilter(text, pass1_result, prefilter_results)
+    else:
+        logger.info("Running Pass 2: full document sensitive item scan...")
+        entities = run_second_pass(text, pass1_result)
 
     # Execute replacement
     logger.info("Executing replacement...")
+    exclude_types = set(t.strip().lower() for t in args.exclude_types.split(",") if t.strip()) if args.exclude_types else set()
     anonymized_text, mapping = execute_replacement(
         text, entities, pass1_result,
         source_filename=os.path.basename(input_path),
+        exclude_types=exclude_types,
     )
+
+    # Record pre-filter and skip metadata
+    mapping["metadata"]["prefilter_entities"] = len(prefilter_results)
+    mapping["metadata"]["pass2_skipped"] = pass2_skipped
 
     # Write outputs
     anon_path = os.path.join(output_dir, "anonymized.txt")
@@ -76,6 +98,8 @@ def cmd_anonymize(args):
         "document_type": pass1_result.get("document_type", "Unknown"),
         "entity_count": mapping["metadata"]["entity_count"],
         "replacements_made": len(mapping["replacement_log"]),
+        "prefilter_entities": len(prefilter_results),
+        "pass2_skipped": mapping["metadata"].get("pass2_skipped", False),
     }
     print(json.dumps(summary, indent=2))
 
@@ -165,6 +189,12 @@ def main():
     anon_parser.add_argument(
         "--output-dir", required=True,
         help="Directory to write anonymized.txt and mapping.json",
+    )
+    anon_parser.add_argument(
+        "--exclude-types", default="",
+        help="Comma-separated entity types to exclude from anonymization (e.g., "
+             "'amount,date'). Valid types: person, company, address, phone, email, "
+             "regnum, bank, amount, date",
     )
 
     # deanonymize subcommand

@@ -8,11 +8,18 @@ Runs every 5 minutes via LaunchAgent. For each completed LDA batch:
 
 Pipeline: group by folder -> CC (all docs in folder together) -> deanonymize -> format -> deliver
 Supports related_batches for cross-batch grouping into a single unified memo.
+
+Task types:
+- memo (default): Legal memo drafting using Office Memo template
+- review-comments: Contract review with inline comments as blockquotes
+- review-redline: Contract review with tracked changes (strikethrough/bold markup)
+- draft: Contract drafting from templates (LOCAL Ollama only, no cloud API)
 """
 
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -127,6 +134,234 @@ def build_memo_prompt(instructions, file_list, section_instructions, date):
     )
 
 
+def build_review_comments_prompt(instructions, file_list):
+    """Build the CC prompt for contract review with inline comments."""
+    # Read the DD review skill for analysis standards
+    dd_guidance = ""
+    dd_path = Path(DD_SKILL_FILE)
+    if dd_path.exists():
+        dd_guidance = (
+            "## Due Diligence Review Standard\n\n"
+            "Follow these analysis standards for document review:\n\n"
+            + dd_path.read_text() + "\n\n"
+        )
+
+    return (
+        "You are a contract review attorney. Review the contract(s) provided and produce "
+        "a commented version.\n\n"
+        + dd_guidance
+        + "## Instructions from the attorney:\n"
+        + instructions + "\n\n"
+        "## Documents to review:\n"
+        + file_list + "\n\n"
+        "## Output Format\n\n"
+        "For each section or clause of the contract:\n"
+        "1. Reproduce the ORIGINAL text verbatim (preserving all formatting and placeholders)\n"
+        "2. Immediately below, add your review comments as blockquotes\n\n"
+        "Comment format — each comment on its own line:\n"
+        "> **[COMMENT]:** explanation of issue/risk/suggestion\n\n"
+        "## Review Focus Areas\n\n"
+        "Focus your comments on:\n"
+        "- **Risks**: Provisions that expose the client to liability or loss\n"
+        "- **Ambiguities**: Vague language that could be interpreted unfavorably\n"
+        "- **Missing provisions**: Standard protections or clauses that are absent\n"
+        "- **Unfavorable terms**: One-sided or below-market provisions\n"
+        "- **Suggestions**: Specific language improvements or additions\n\n"
+        "## Example Output\n\n"
+        "```\n"
+        "## 3. Term and Termination\n\n"
+        "This Agreement shall commence on the Effective Date and continue for a period "
+        "of three (3) years, unless earlier terminated by either party upon thirty (30) "
+        "days written notice.\n\n"
+        "> **[COMMENT]:** The 30-day notice period is relatively short. Consider "
+        "extending to 60 or 90 days to allow adequate transition time.\n\n"
+        "> **[COMMENT]:** No termination-for-cause provision. Recommend adding a "
+        "clause allowing immediate termination for material breach.\n"
+        "```\n\n"
+        "## CRITICAL RULES:\n"
+        "- Preserve ALL {PLACEHOLDER} tokens exactly as they appear\n"
+        "- Do NOT invent or guess real names\n"
+        "- Reproduce the original contract text VERBATIM — do not paraphrase or summarize\n"
+        "- Use markdown ## for section headings so pandoc can style them\n"
+        "- Place comments AFTER each section, not inline within the text\n"
+        "- Your response must start IMMEDIATELY with the contract review — no preamble\n"
+    )
+
+
+def build_review_redline_prompt(instructions, file_list):
+    """Build the CC prompt for contract review with tracked changes (redline)."""
+    # Read the DD review skill for analysis standards
+    dd_guidance = ""
+    dd_path = Path(DD_SKILL_FILE)
+    if dd_path.exists():
+        dd_guidance = (
+            "## Due Diligence Review Standard\n\n"
+            "Follow these analysis standards for document review:\n\n"
+            + dd_path.read_text() + "\n\n"
+        )
+
+    return (
+        "You are a contract review attorney. Review and revise the contract(s) provided, "
+        "producing a redlined version that shows all changes.\n\n"
+        + dd_guidance
+        + "## Instructions from the attorney:\n"
+        + instructions + "\n\n"
+        "## Documents to review and revise:\n"
+        + file_list + "\n\n"
+        "## Output Format\n\n"
+        "Produce a single document that shows ALL changes using this markup convention:\n"
+        "- **Deletions**: Show removed text in ~~strikethrough~~ (e.g., ~~old text~~)\n"
+        "- **Additions**: Show new text in **bold** (e.g., **new text**)\n"
+        "- Unchanged text remains as-is\n\n"
+        "After the redlined document, include a section:\n\n"
+        "## Summary of Changes\n\n"
+        "List each change made with:\n"
+        "- Section/clause reference\n"
+        "- Brief description of the change\n"
+        "- Rationale for the change\n\n"
+        "## Review Focus Areas\n\n"
+        "Make specific textual edits to improve the contract. Focus on:\n"
+        "- **Ambiguities**: Tighten vague language with precise terms\n"
+        "- **Missing protections**: Add standard protective provisions\n"
+        "- **Unfavorable terms**: Rebalance one-sided provisions\n"
+        "- **Language quality**: Fix inconsistencies, improve clarity\n"
+        "- **Legal compliance**: Ensure provisions comply with applicable law\n\n"
+        "## Example Output\n\n"
+        "```\n"
+        "## 3. Term and Termination\n\n"
+        "This Agreement shall commence on the Effective Date and continue for a period "
+        "of ~~three (3)~~ **five (5)** years, unless earlier terminated by either party "
+        "upon ~~thirty (30)~~ **sixty (60)** days written notice. **Notwithstanding the "
+        "foregoing, either party may terminate this Agreement immediately upon written "
+        "notice if the other party commits a material breach that remains uncured for "
+        "thirty (30) days after receipt of written notice thereof.**\n"
+        "```\n\n"
+        "## CRITICAL RULES:\n"
+        "- Preserve ALL {PLACEHOLDER} tokens exactly as they appear\n"
+        "- Do NOT invent or guess real names\n"
+        "- Use ~~strikethrough~~ for deletions and **bold** for additions CONSISTENTLY\n"
+        "- Use markdown ## for section headings so pandoc can style them\n"
+        "- Include the Summary of Changes section at the end\n"
+        "- Your response must start IMMEDIATELY with the redlined document — no preamble\n"
+    )
+
+
+def build_draft_prompt(instructions, file_list, date):
+    """Build the prompt for contract drafting from templates (local Ollama)."""
+    return (
+        "You are drafting a contract based on the template(s) provided. "
+        "Follow the template structure but customize with the specific terms "
+        "described in the instructions. Preserve all formatting and section numbering. "
+        "Output the complete drafted contract.\n\n"
+        "## Instructions from the attorney:\n"
+        + instructions + "\n\n"
+        "## Template document(s):\n"
+        + file_list + "\n\n"
+        "## Date:\n"
+        + date + "\n\n"
+        "## CRITICAL RULES:\n"
+        "- Follow the template structure exactly — do not reorganize sections\n"
+        "- Replace all template blanks/brackets with the specific terms from the instructions\n"
+        "- Preserve ALL {PLACEHOLDER} tokens exactly as they appear (these are anonymized names)\n"
+        "- Do NOT invent or guess real names — only use names/terms provided in the instructions\n"
+        "- Keep all section numbering, headings, and formatting from the template\n"
+        "- Use markdown ## for section headings so pandoc can style them\n"
+        "- Your response must start IMMEDIATELY with the drafted contract — no preamble, no commentary\n"
+    )
+
+
+def call_local_llm(prompt, model="qwen3.5-legal"):
+    """Call local LLM for privacy-sensitive tasks. Tries MLX first, falls back to Ollama."""
+    # Try MLX first (faster, better JSON output)
+    try:
+        mlx_payload = json.dumps({
+            "model": "/Users/claptrap/finetune/mlx-legal",
+            "messages": [
+                {"role": "system", "content": "/no_think"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 8192,
+        }).encode()
+        req = urllib.request.Request(
+            "http://127.0.0.1:8801/v1/chat/completions",
+            data=mlx_payload,
+            headers={"Content-Type": "application/json"}
+        )
+        resp = urllib.request.urlopen(req, timeout=600)
+        data = json.loads(resp.read())
+        content = data["choices"][0]["message"]["content"]
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        return content
+    except Exception as e:
+        logging.warning("MLX failed (%s), falling back to Ollama", e)
+
+    # Fallback to Ollama
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "options": {"num_ctx": 32768, "num_predict": 8192, "temperature": 0.3}
+    }).encode()
+    req = urllib.request.Request(
+        "http://127.0.0.1:11434/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"}
+    )
+    resp = urllib.request.urlopen(req, timeout=600)
+    data = json.loads(resp.read())
+    content = data.get("message", {}).get("content", "")
+    content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+    return content
+
+
+def _get_task_type(meta):
+    """Get task type from batch meta, defaulting to 'memo' for backward compatibility."""
+    return meta.get("task_type", "memo")
+
+
+def _task_type_label(task_type):
+    """Human-readable label for a task type."""
+    labels = {
+        "memo": "legal memo",
+        "review-comments": "contract review (comments)",
+        "review-redline": "contract review (redline)",
+        "draft": "contract draft",
+    }
+    return labels.get(task_type, task_type)
+
+
+def _build_prompt_for_task(task_type, instructions, file_list, section_instructions=None, date=None):
+    """Build the appropriate prompt based on task type."""
+    if task_type == "review-comments":
+        return build_review_comments_prompt(instructions, file_list)
+    elif task_type == "review-redline":
+        return build_review_redline_prompt(instructions, file_list)
+    elif task_type == "draft":
+        return build_draft_prompt(
+            instructions, file_list,
+            date or datetime.now().strftime("%B %d, %Y"),
+        )
+    else:
+        # Default: memo
+        return build_memo_prompt(
+            instructions, file_list,
+            section_instructions or "",
+            date or datetime.now().strftime("%B %d, %Y"),
+        )
+
+
+def _output_filename_prefix(task_type):
+    """Return the output filename prefix based on task type."""
+    prefixes = {
+        "memo": "memo",
+        "review-comments": "review_comments",
+        "review-redline": "review_redline",
+        "draft": "draft",
+    }
+    return prefixes.get(task_type, "memo")
+
+
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     with open(LOG_FILE, "a") as f:
@@ -219,16 +454,10 @@ def get_batch_instructions(batch_id):
 
 
 def check_cc_login():
-    try:
-        result = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", "-p", "Reply with just the word OK"],
-            capture_output=True, text=True, timeout=60, env=ENV,
-        )
-        if "login" in result.stderr.lower() or "not logged in" in result.stdout.lower():
-            return False
-        return result.returncode == 0 and "OK" in result.stdout
-    except Exception:
-        return False
+    # Skip login check — let CC fail at runtime with a clear error
+    # rather than silently skipping batches. The SSH environment
+    # often can't access Keychain, but launchd/terminal context can.
+    return True
 
 
 def extract_folder(input_file_path):
@@ -358,7 +587,7 @@ def remap_placeholders(anon_text, mapping_data, job_suffix):
 
 
 
-def process_folder_group(folder_name, jobs, instructions, batch_output):
+def process_folder_group(folder_name, jobs, instructions, batch_output, task_type="memo"):
     """Process all files in a folder group as a single CC call."""
     safe_folder = folder_name.replace("/", "_").replace(" ", "_") or "root"
 
@@ -375,34 +604,73 @@ def process_folder_group(folder_name, jobs, instructions, batch_output):
     for i, (job_id, anon_path, orig_name) in enumerate(anon_files, 1):
         file_refs.append("Document " + str(i) + " (job " + job_id + "): " + str(anon_path))
 
-    prompt = (
-        "You are analyzing a group of " + str(len(anon_files)) + " related documents "
-        "from the folder '" + folder_name + "'. "
-        "These documents are all connected and MUST be analyzed together as a set.\n\n"
-        "Read ALL of the following files:\n"
-        + "\n".join("- " + ref for ref in file_refs)
-        + "\n\n" + instructions + "\n\n"
-        "IMPORTANT:\n"
-        "- Analyze all documents in conjunction, not individually.\n"
-        "- Identify relationships, cross-references, and dependencies between documents.\n"
-        "- Provide conclusions about the group as a whole.\n"
-        "- Preserve ALL {PLACEHOLDER} tokens exactly as they appear.\n"
-        "- Output ONLY the analysis/memo content, no preamble."
-    )
+    file_list = "\n".join("- " + ref for ref in file_refs)
+
+    if task_type == "draft":
+        # For draft tasks, read template files inline and call local Ollama
+        doc_contents = []
+        for job_id, anon_path, orig_name in anon_files:
+            try:
+                content = anon_path.read_text()
+                doc_contents.append("### " + orig_name + "\n\n" + content)
+            except Exception:
+                doc_contents.append("### " + orig_name + "\n\n[Error reading file]")
+        file_list_with_content = "\n\n---\n\n".join(doc_contents)
+        today = datetime.now().strftime("%B %d, %Y")
+        prompt = build_draft_prompt(instructions, file_list_with_content, today)
+    elif task_type in ("review-comments", "review-redline"):
+        # For review task types, use the specialized prompt
+        base_prompt = _build_prompt_for_task(task_type, instructions, file_list)
+        prompt = (
+            "You are analyzing a group of " + str(len(anon_files)) + " related documents "
+            "from the folder '" + folder_name + "'. "
+            "These documents are all connected and MUST be analyzed together as a set.\n\n"
+            "Read ALL of the following files:\n"
+            + file_list + "\n\n"
+            + base_prompt
+        )
+    else:
+        # Original memo prompt for folder groups
+        prompt = (
+            "You are analyzing a group of " + str(len(anon_files)) + " related documents "
+            "from the folder '" + folder_name + "'. "
+            "These documents are all connected and MUST be analyzed together as a set.\n\n"
+            "Read ALL of the following files:\n"
+            + file_list
+            + "\n\n" + instructions + "\n\n"
+            "IMPORTANT:\n"
+            "- Analyze all documents in conjunction, not individually.\n"
+            "- Identify relationships, cross-references, and dependencies between documents.\n"
+            "- Provide conclusions about the group as a whole.\n"
+            "- Preserve ALL {PLACEHOLDER} tokens exactly as they appear.\n"
+            "- Output ONLY the analysis/memo content, no preamble."
+        )
 
     cc_output = batch_output / (safe_folder + "_cc.md")
-    try:
-        cc_result = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", "-p", prompt],
-            capture_output=True, text=True, timeout=600, env=ENV,
-        )
-        if cc_result.returncode != 0:
-            log("CC failed for folder " + folder_name + ": " + cc_result.stderr[:200])
-            return {"folder": folder_name, "status": "cc_failed"}
-        cc_output.write_text(cc_result.stdout)
-    except subprocess.TimeoutExpired:
-        log("CC timeout for folder " + folder_name)
-        return {"folder": folder_name, "status": "cc_timeout"}
+    if task_type == "draft":
+        # Use local Ollama instead of Claude Code CLI
+        try:
+            result_text = call_local_llm(prompt)
+            if not result_text:
+                log("Ollama returned empty response for folder " + folder_name)
+                return {"folder": folder_name, "status": "ollama_failed"}
+            cc_output.write_text(result_text)
+        except Exception as e:
+            log("Ollama failed for folder " + folder_name + ": " + str(e))
+            return {"folder": folder_name, "status": "ollama_failed"}
+    else:
+        try:
+            cc_result = subprocess.run(
+                ["claude", "--print", "--dangerously-skip-permissions", "-p", prompt],
+                capture_output=True, text=True, timeout=600, env=ENV,
+            )
+            if cc_result.returncode != 0:
+                log("CC failed for folder " + folder_name + ": " + cc_result.stderr[:200])
+                return {"folder": folder_name, "status": "cc_failed"}
+            cc_output.write_text(cc_result.stdout)
+        except subprocess.TimeoutExpired:
+            log("CC timeout for folder " + folder_name)
+            return {"folder": folder_name, "status": "cc_timeout"}
 
     merged = merge_mappings(jobs)
     merged_mapping_file = batch_output / (safe_folder + "_mapping.json")
@@ -423,19 +691,55 @@ def process_folder_group(folder_name, jobs, instructions, batch_output):
         return {"folder": folder_name, "status": "deanon_failed"}
 
     docx_file = batch_output / (safe_folder + ".docx")
-    try:
-        subprocess.run(
-            ["pandoc", str(deanon_file), "-o", str(docx_file),
-             "--reference-doc=" + LEGAL_REF],
-            capture_output=True, text=True, timeout=60, env=ENV,
-        )
-    except Exception:
-        pass
+    if task_type == "review-redline":
+        try:
+            from core.tracked_changes import create_redline_docx
+            create_redline_docx(deanon_file, docx_file, reference_doc=LEGAL_REF, author="Associate")
+            log("Created tracked-changes docx for folder " + folder_name)
+        except Exception as e:
+            log("Tracked changes failed for " + folder_name + ": " + str(e) + ", falling back to pandoc")
+            try:
+                subprocess.run(
+                    ["pandoc", str(deanon_file), "-o", str(docx_file),
+                     "--reference-doc=" + LEGAL_REF],
+                    capture_output=True, text=True, timeout=60, env=ENV,
+                )
+            except Exception:
+                pass
+    elif task_type == "review-comments":
+        try:
+            from core.tracked_changes import create_commented_docx
+            create_commented_docx(deanon_file, docx_file, reference_doc=LEGAL_REF, author="Associate")
+            log("Created commented docx for folder " + folder_name)
+        except Exception as e:
+            log("Commented docx failed for " + folder_name + ": " + str(e) + ", falling back to pandoc")
+            try:
+                subprocess.run(
+                    ["pandoc", str(deanon_file), "-o", str(docx_file),
+                     "--reference-doc=" + LEGAL_REF],
+                    capture_output=True, text=True, timeout=60, env=ENV,
+                )
+            except Exception:
+                pass
+    else:
+        try:
+            subprocess.run(
+                ["pandoc", str(deanon_file), "-o", str(docx_file),
+                 "--reference-doc=" + LEGAL_REF],
+                capture_output=True, text=True, timeout=60, env=ENV,
+            )
+        except Exception:
+            pass
 
-    if docx_file.exists():
+    if docx_file.exists() and task_type == "memo":
         format_docx(docx_file)
     output_file = str(docx_file) if docx_file.exists() else str(deanon_file)
-    return {"folder": folder_name, "status": "success", "file": output_file, "doc_count": len(anon_files)}
+    result = {"folder": folder_name, "status": "success", "file": output_file, "doc_count": len(anon_files)}
+    # Include clean version for redline tasks
+    clean_docx_path = batch_output / (safe_folder + "_clean.docx")
+    if clean_docx_path.exists():
+        result["clean_file"] = str(clean_docx_path)
+    return result
 
 
 
@@ -448,7 +752,7 @@ def format_docx(docx_path):
     except ImportError:
         # Try LDA venv
         import subprocess, sys
-        subprocess.run([VENV_PYTHON, "-c", 
+        subprocess.run([VENV_PYTHON, "-c",
             "from docx import Document; "
             "from docx.enum.text import WD_ALIGN_PARAGRAPH; "
             "from docx.shared import Pt; "
@@ -470,11 +774,13 @@ def format_docx(docx_path):
             break
     doc.save(str(docx_path))
 
-def process_unified_memo(all_batch_ids, all_jobs, instructions, output_dir):
-    """Process multiple batches as a single unified memo using legal-memo format.
+def process_unified_memo(all_batch_ids, all_jobs, instructions, output_dir, task_type="memo"):
+    """Process multiple batches as a single unified output.
 
-    Groups all files by top-level folder, feeds everything to CC in one call
-    with the Office Memo template, then deanonymizes and formats.
+    For memo: Office Memo format with sections per category.
+    For review-comments: Contract review with inline blockquote comments.
+    For review-redline: Contract review with strikethrough/bold tracked changes.
+    For draft: Contract drafting from templates (local Ollama only).
     """
     group_id = all_batch_ids[0]  # Use primary batch as group identifier
     batch_output = output_dir / ("group-" + group_id)
@@ -505,67 +811,95 @@ def process_unified_memo(all_batch_ids, all_jobs, instructions, output_dir):
                     remapped_text, remapped_map = remap_placeholders(anon_text, raw_mapping, job_suffix)
                     remapped_file = batch_output / (job_suffix + "_anon.txt")
                     remapped_file.write_text(remapped_text)
-                    file_list_parts.append("- " + str(remapped_file) + " (job " + job["job_id"] + ")")
+                    if task_type == "draft":
+                        # Include file content inline for Ollama (can't read files)
+                        orig_name = job.get("input_filename", "document")
+                        file_list_parts.append(
+                            "\n### " + orig_name + "\n\n" + remapped_text
+                        )
+                    else:
+                        file_list_parts.append("- " + str(remapped_file) + " (job " + job["job_id"] + ")")
                     all_remapped_mappings["mappings"].update(remapped_map["mappings"])
                     all_remapped_mappings["replacement_log"].extend(remapped_map["replacement_log"])
                 except Exception as e:
                     file_list_parts.append("- " + str(anon_file) + " (job " + job["job_id"] + ")")
 
-        roman = _to_roman(section_num)
-        section_instructions_parts.append(
-            roman + ". " + folder_name + "\n\n"
-            "[Analyze ALL documents in the " + folder_name + " category together. "
-            "Identify key issues, obligations, risks, and notable provisions. "
-            "Use sub-headings for each major issue found.]\n"
-        )
-        section_num += 1
+        # Only build section instructions for memo task type
+        if task_type == "memo":
+            roman = _to_roman(section_num)
+            section_instructions_parts.append(
+                roman + ". " + folder_name + "\n\n"
+                "[Analyze ALL documents in the " + folder_name + " category together. "
+                "Identify key issues, obligations, risks, and notable provisions. "
+                "Use sub-headings for each major issue found.]\n"
+            )
+            section_num += 1
 
     file_list = "\n".join(file_list_parts)
     section_instructions = "\n".join(section_instructions_parts)
     today = datetime.now().strftime("%B %d, %Y")
 
-    prompt = build_memo_prompt(instructions, file_list, section_instructions, today)
-    prompt += "\n\nRead ALL files listed above before writing the memo."
+    # Build prompt based on task type
+    prompt = _build_prompt_for_task(task_type, instructions, file_list, section_instructions, today)
+    prompt += "\n\nRead ALL files listed above before writing."
 
     total_files = len(completed_jobs)
+    label = _task_type_label(task_type)
     send_signal(
-        "Unified memo pipeline started\n"
+        "Unified " + label + " pipeline started\n"
         "Batches: " + ", ".join(all_batch_ids) + "\n"
         "Files: " + str(total_files) + " across " + str(len(folder_groups)) + " categories\n"
         + "\n".join("  " + k + ": " + str(len(v)) + " docs" for k, v in sorted(folder_groups.items()))
-        + "\n\nGenerating unified legal memo with CC..."
+        + "\n\nGenerating " + label + " with " + ("local Ollama..." if task_type == "draft" else "CC...")
     )
 
-    # Single CC call for the entire memo
-    cc_output = batch_output / "memo_cc.md"
-    try:
-        cc_result = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", "-p", prompt],
-            capture_output=True, text=True, timeout=900, env=ENV,  # 15 min for large unified memo
-        )
-        if cc_result.returncode != 0:
-            log("CC failed for unified memo: " + cc_result.stderr[:200])
-            send_signal("CC failed for unified memo. Error: " + cc_result.stderr[:200])
+    # Single generation call
+    prefix = _output_filename_prefix(task_type)
+    cc_output = batch_output / (prefix + "_cc.md")
+    if task_type == "draft":
+        # Use local Ollama for privacy-sensitive drafting
+        try:
+            result_text = call_local_llm(prompt)
+            if not result_text:
+                log("Ollama returned empty response for unified draft")
+                send_signal("Ollama returned empty response for unified contract draft.")
+                return None
+            cc_output.write_text(result_text)
+        except Exception as e:
+            log("Ollama failed for unified draft: " + str(e))
+            send_signal("Ollama failed for unified contract draft. Error: " + str(e)[:200])
             return None
-        # Strip any AI preamble before "MEMORANDUM"
-        cc_text = cc_result.stdout
-        memo_start = cc_text.find("MEMORANDUM")
-        if memo_start > 0:
-            cc_text = cc_text[memo_start:]
-        cc_output.write_text(cc_text)
-    except subprocess.TimeoutExpired:
-        log("CC timeout for unified memo")
-        send_signal("CC timed out generating the unified memo (15 min limit).")
-        return None
+    else:
+        try:
+            cc_result = subprocess.run(
+                ["claude", "--print", "--dangerously-skip-permissions", "-p", prompt],
+                capture_output=True, text=True, timeout=900, env=ENV,  # 15 min for large unified output
+            )
+            if cc_result.returncode != 0:
+                log("CC failed for unified " + label + ": " + cc_result.stderr[:200])
+                send_signal("CC failed for unified " + label + ". Error: " + cc_result.stderr[:200])
+                return None
+            cc_text = cc_result.stdout
+            # Strip any AI preamble before "MEMORANDUM" (memo only)
+            if task_type == "memo":
+                memo_start = cc_text.find("MEMORANDUM")
+                if memo_start > 0:
+                    cc_text = cc_text[memo_start:]
+            cc_output.write_text(cc_text)
+        except subprocess.TimeoutExpired:
+            log("CC timeout for unified " + label)
+            send_signal("CC timed out generating the unified " + label + " (15 min limit).")
+            return None
 
-    send_signal("CC analysis complete. Deanonymizing and formatting...")
+    engine = "Ollama" if task_type == "draft" else "CC"
+    send_signal(engine + " generation complete. Deanonymizing and formatting...")
 
     # Use pre-built remapped mappings (no cross-job placeholder conflicts)
-    merged_mapping_file = batch_output / "memo_mapping.json"
+    merged_mapping_file = batch_output / (prefix + "_mapping.json")
     merged_mapping_file.write_text(json.dumps(all_remapped_mappings, indent=2))
 
     # Deanonymize
-    deanon_file = batch_output / "memo_final.md"
+    deanon_file = batch_output / (prefix + "_final.md")
     try:
         subprocess.run(
             [VENV_PYTHON, LDA_CLI, "deanonymize",
@@ -598,21 +932,56 @@ def process_unified_memo(all_batch_ids, all_jobs, instructions, output_dir):
         pass
 
     # Format to .docx
-    docx_file = batch_output / "memo.docx"
-    try:
-        subprocess.run(
-            ["pandoc", str(deanon_file), "-o", str(docx_file),
-             "--reference-doc=" + LEGAL_REF],
-            capture_output=True, text=True, timeout=60, env=ENV,
-        )
-    except Exception:
-        pass
+    docx_file = batch_output / (prefix + ".docx")
+    if task_type == "review-redline":
+        try:
+            from core.tracked_changes import create_redline_docx
+            create_redline_docx(deanon_file, docx_file, reference_doc=LEGAL_REF, author="Associate")
+            log("Created tracked-changes docx for unified output")
+        except Exception as e:
+            log("Tracked changes failed for unified: " + str(e) + ", falling back to pandoc")
+            try:
+                subprocess.run(
+                    ["pandoc", str(deanon_file), "-o", str(docx_file),
+                     "--reference-doc=" + LEGAL_REF],
+                    capture_output=True, text=True, timeout=60, env=ENV,
+                )
+            except Exception:
+                pass
+    elif task_type == "review-comments":
+        try:
+            from core.tracked_changes import create_commented_docx
+            create_commented_docx(deanon_file, docx_file, reference_doc=LEGAL_REF, author="Associate")
+            log("Created commented docx for unified output")
+        except Exception as e:
+            log("Commented docx failed for unified: " + str(e) + ", falling back to pandoc")
+            try:
+                subprocess.run(
+                    ["pandoc", str(deanon_file), "-o", str(docx_file),
+                     "--reference-doc=" + LEGAL_REF],
+                    capture_output=True, text=True, timeout=60, env=ENV,
+                )
+            except Exception:
+                pass
+    else:
+        try:
+            subprocess.run(
+                ["pandoc", str(deanon_file), "-o", str(docx_file),
+                 "--reference-doc=" + LEGAL_REF],
+                capture_output=True, text=True, timeout=60, env=ENV,
+            )
+        except Exception:
+            pass
 
-    if docx_file.exists():
+    if docx_file.exists() and task_type == "memo":
         format_docx(docx_file)
     output_file = str(docx_file) if docx_file.exists() else str(deanon_file)
-    return {"status": "success", "file": output_file, "total_files": total_files,
-            "categories": len(folder_groups)}
+    clean_docx_path = batch_output / (prefix + "_clean.docx")
+    result = {"status": "success", "file": output_file, "total_files": total_files,
+            "categories": len(folder_groups), "task_type": task_type}
+    if clean_docx_path.exists():
+        result["clean_file"] = str(clean_docx_path)
+    return result
 
 
 def _to_roman(num):
@@ -628,7 +997,7 @@ def _to_roman(num):
     return result
 
 
-def run_pipeline(batch_id, batch_info, instructions):
+def run_pipeline(batch_id, batch_info, instructions, task_type="memo"):
     """Run CC pipeline grouped by folder with progress updates (single-batch mode)."""
     batch_output = OUTPUT_DIR / batch_id
     batch_output.mkdir(parents=True, exist_ok=True)
@@ -640,29 +1009,32 @@ def run_pipeline(batch_id, batch_info, instructions):
     results = []
     start_time = time.time()
 
+    label = _task_type_label(task_type)
     folder_desc = "\n".join(
         "  " + (name or "(root)") + ": " + str(len(jobs)) + " docs"
         for name, jobs in folder_groups.items()
     )
     send_signal(
-        "Auto-pipeline started\n"
+        "Auto-pipeline started (" + label + ")\n"
         "Batch: " + batch_id + "\n"
         "Files: " + str(total_files) + " in " + str(total_groups) + " folder(s)\n"
         + folder_desc + "\n\n"
-        "Documents in each folder will be analyzed together.\n"
+        "Documents in each folder will be " + ("drafted" if task_type == "draft" else "analyzed") + " together.\n"
         + progress_bar(0, total_groups)
     )
-    log("Starting pipeline for " + batch_id + " (" + str(total_files) + " files, " + str(total_groups) + " folders)")
+    log("Starting pipeline (" + task_type + ") for " + batch_id + " (" + str(total_files) + " files, " + str(total_groups) + " folders)")
 
+    engine = "local Ollama" if task_type == "draft" else "CC"
+    action = "Drafting" if task_type == "draft" else "Analyzing"
     for i, (folder_name, jobs) in enumerate(folder_groups.items()):
         display_name = folder_name or "(root)"
         send_signal(
             progress_bar(i, total_groups) + "\n"
             "Processing folder " + str(i + 1) + "/" + str(total_groups) + ": " + display_name + "\n"
-            "Analyzing " + str(len(jobs)) + " documents together with CC..."
+            + action + " " + str(len(jobs)) + " documents with " + engine + "..."
         )
 
-        result = process_folder_group(folder_name, jobs, instructions, batch_output)
+        result = process_folder_group(folder_name, jobs, instructions, batch_output, task_type=task_type)
         results.append(result)
 
         elapsed = time.time() - start_time
@@ -697,9 +1069,13 @@ def deliver_results(batch_id, results, start_time):
         send_signal(msg)
         return
 
-    for i in range(0, len(success_files), 5):
-        chunk = success_files[i:i + 5]
-        chunk_msg = msg if i == 0 else "Files " + str(i + 1) + "-" + str(i + len(chunk)) + " of " + str(len(success_files)) + ":"
+    # Collect clean files for redline tasks
+    clean_files = [r.get("clean_file") for r in results if r.get("clean_file")]
+    all_files = success_files + clean_files
+
+    for i in range(0, len(all_files), 5):
+        chunk = all_files[i:i + 5]
+        chunk_msg = msg if i == 0 else "Files " + str(i + 1) + "-" + str(i + len(chunk)) + " of " + str(len(all_files)) + ":"
         resp = send_signal(chunk_msg, attachments=chunk)
         if resp and resp.get("error"):
             send_signal(chunk_msg + "\nFiles saved at:\n" + "\n".join(chunk))
@@ -707,23 +1083,28 @@ def deliver_results(batch_id, results, start_time):
 
 
 def deliver_unified_result(result, batch_ids, start_time):
-    """Deliver a unified memo result."""
+    """Deliver a unified result (memo, review-comments, or review-redline)."""
     total_time = format_duration(time.time() - start_time)
     if not result or result.get("status") != "success":
-        send_signal("Unified memo pipeline failed after " + total_time)
+        send_signal("Unified pipeline failed after " + total_time)
         return
 
+    label = _task_type_label(result.get("task_type", "memo"))
     msg = (
         progress_bar(1, 1) + "\n"
-        "Unified memo complete\n"
+        "Unified " + label + " complete\n"
         "Batches: " + str(len(batch_ids)) + " | "
         "Files: " + str(result.get("total_files", "?")) + " | "
         "Categories: " + str(result.get("categories", "?")) + "\n"
         "Total time: " + total_time
     )
-    resp = send_signal(msg, attachments=[result["file"]])
+    attachments = [result["file"]]
+    if result.get("clean_file"):
+        attachments.append(result["clean_file"])
+        msg += "\nIncludes: redlined + clean version"
+    resp = send_signal(msg, attachments=attachments)
     if resp and resp.get("error"):
-        send_signal(msg + "\nFile saved at: " + result["file"])
+        send_signal(msg + "\nFiles saved at:\n" + "\n".join(attachments))
 
 
 def resolve_batch_groups(batches, all_completed):
@@ -787,11 +1168,13 @@ def main():
         for item in items:
             if item[0] == "group":
                 _, batch_ids, meta = item
+                task_type = _get_task_type(meta)
                 # Check if primary is already processed
                 if is_in_file(PROCESSED_FILE, batch_ids[0]):
                     continue
 
-                if not check_cc_login():
+                # Draft uses local Ollama — no CC login needed
+                if task_type != "draft" and not check_cc_login():
                     if not is_in_file(NOTIFIED_FILE, batch_ids[0]):
                         total = sum(all_completed[bid]["completed"] for bid in batch_ids if bid in all_completed)
                         send_signal(
@@ -810,9 +1193,10 @@ def main():
                         all_jobs.extend(all_completed[bid]["jobs"])
 
                 total = sum(all_completed.get(bid, {}).get("completed", 0) for bid in batch_ids)
-                log("Starting unified memo for " + str(len(batch_ids)) + " batches (" + str(total) + " files)")
+                label = _task_type_label(task_type)
+                log("Starting unified " + label + " for " + str(len(batch_ids)) + " batches (" + str(total) + " files)")
 
-                result = process_unified_memo(batch_ids, all_jobs, meta["instructions"], OUTPUT_DIR)
+                result = process_unified_memo(batch_ids, all_jobs, meta["instructions"], OUTPUT_DIR, task_type=task_type)
                 deliver_unified_result(result, batch_ids, start_time)
 
                 # Mark all batches as processed
@@ -820,12 +1204,14 @@ def main():
                     append_to_file(PROCESSED_FILE, bid)
 
                 status = "OK" if result and result.get("status") == "success" else "FAILED"
-                log("Unified memo done for " + ",".join(batch_ids) + ": " + status)
+                log("Unified " + label + " done for " + ",".join(batch_ids) + ": " + status)
 
             elif item[0] == "single":
                 _, batch_id, meta = item
+                task_type = _get_task_type(meta)
 
-                if not check_cc_login():
+                # Draft uses local Ollama — no CC login needed
+                if task_type != "draft" and not check_cc_login():
                     if not is_in_file(NOTIFIED_FILE, batch_id):
                         info = all_completed[batch_id]
                         send_signal(
@@ -838,11 +1224,11 @@ def main():
 
                 info = all_completed[batch_id]
                 start_time = time.time()
-                results = run_pipeline(batch_id, info, meta["instructions"])
+                results = run_pipeline(batch_id, info, meta["instructions"], task_type=task_type)
                 deliver_results(batch_id, results, start_time)
                 append_to_file(PROCESSED_FILE, batch_id)
                 ok = len([r for r in results if r["status"] == "success"])
-                log("Pipeline done for " + batch_id + ": " + str(ok) + "/" + str(len(results)) + " folder groups OK")
+                log("Pipeline (" + task_type + ") done for " + batch_id + ": " + str(ok) + "/" + str(len(results)) + " folder groups OK")
 
         # Handle batches with no instructions (notification only)
         for batch_id, info in all_completed.items():

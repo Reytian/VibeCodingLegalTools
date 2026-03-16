@@ -2,10 +2,13 @@
 """Save batch meta instructions for the LDA auto-pipeline.
 
 Usage:
-    save_batch_meta.py <batch_id> <instructions> [--related <batch_id> ...]
+    save_batch_meta.py <batch_id> <instructions> [--related <batch_id> ...] [--task-type memo|review-comments|review-redline|draft]
 
 Examples:
     save_batch_meta.py batch-20260305-002704 "Analyze contracts for expiration"
+    save_batch_meta.py batch-20260305-002704 "Review this NDA" --task-type review-comments
+    save_batch_meta.py batch-20260305-002704 "Revise this contract" --task-type review-redline
+    save_batch_meta.py batch-20260305-002704 "Draft NDA: Parties are X and Y, 2-year term" --task-type draft
     save_batch_meta.py batch-20260305-002704 "Write a unified memo" --related batch-20260305-002657 batch-20260305-002703
 """
 
@@ -17,6 +20,8 @@ from pathlib import Path
 
 JOBS_DIR = Path.home() / ".openclaw/tools/lda/jobs"
 META_DIR = JOBS_DIR / ".batch_meta"
+
+VALID_TASK_TYPES = ["memo", "review-comments", "review-redline", "draft"]
 
 
 def count_batch_files(batch_id):
@@ -41,6 +46,12 @@ def main():
     parser.add_argument("batch_id", help="Primary batch ID (e.g., batch-20260305-002704)")
     parser.add_argument("instructions", help="Processing instructions for CC")
     parser.add_argument("--related", nargs="+", default=[], help="Related batch IDs to group together")
+    parser.add_argument(
+        "--task-type",
+        choices=VALID_TASK_TYPES,
+        default="memo",
+        help="Task type: memo (default), review-comments, review-redline, or draft",
+    )
     args = parser.parse_args()
 
     META_DIR.mkdir(parents=True, exist_ok=True)
@@ -65,6 +76,7 @@ def main():
     meta = {
         "batch_id": args.batch_id,
         "instructions": args.instructions,
+        "task_type": args.task_type,
         "submitted_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "file_count": total_files,
     }
@@ -80,6 +92,7 @@ def main():
         related_meta = {
             "batch_id": rid,
             "instructions": args.instructions,
+            "task_type": args.task_type,
             "submitted_at": meta["submitted_at"],
             "file_count": count_batch_files(rid),
             "primary_batch": args.batch_id,
@@ -91,6 +104,7 @@ def main():
         "status": "saved",
         "meta_file": str(meta_file),
         "batch_id": args.batch_id,
+        "task_type": args.task_type,
         "related_batches": args.related,
         "total_files": total_files,
     }

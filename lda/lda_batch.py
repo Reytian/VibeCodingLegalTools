@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-LDA Batch Processor — sequential job queue for long document anonymization.
+LDA Batch Processor — parallel job queue for long document anonymization.
 
-Jobs are queued and processed one at a time by a background worker.
+Jobs are queued and processed by background worker threads (default: 1, configurable).
 Submit and status commands return instantly. Queued jobs can be cancelled.
 
 Usage:
@@ -13,7 +13,7 @@ Usage:
   lda_batch.py list
   lda_batch.py clean [--days 7]
   lda_batch.py batch-status <batch-id>
-  lda_batch.py worker          (internal — started automatically by submit)
+  lda_batch.py worker [--workers N]  (internal — started automatically by submit)
 """
 
 import argparse
@@ -29,6 +29,9 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 import zipfile
+import fcntl
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 JOBS_DIR = Path(__file__).parent / "jobs"
 CACHE_DIR = Path(__file__).parent / "cache"
@@ -41,6 +44,38 @@ SUPPORTED_EXTENSIONS = {'.txt', '.doc', '.docx', '.pdf'}
 OLLAMA_URL = "http://127.0.0.1:11434"
 JOB_TIMEOUT = 600  # seconds per job
 MAX_RETRIES = 2
+DEFAULT_WORKERS = 1
+
+# ── Signal Notifications ─────────────────────────────────
+
+SIGNAL_API_URL = "http://127.0.0.1:8080/api/v1/rpc"
+SIGNAL_ACCOUNT = "+14085969922"
+SIGNAL_RECIPIENT = "+12063498761"
+
+
+def send_signal(message):
+    """Send a best-effort Signal notification. Never raises."""
+    import urllib.request
+    payload = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "send",
+        "params": {
+            "account": SIGNAL_ACCOUNT,
+            "recipients": [SIGNAL_RECIPIENT],
+            "message": message,
+        },
+        "id": 1,
+    }).encode()
+    req = urllib.request.Request(
+        SIGNAL_API_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass  # Best-effort notification
 
 
 def compute_file_hash(file_path: Path) -> str:
@@ -186,14 +221,17 @@ def is_worker_running() -> bool:
         return False
 
 
-def ensure_worker():
+def ensure_worker(num_workers: int = DEFAULT_WORKERS):
     """Start the background worker if it's not already running."""
     if is_worker_running():
         return
     log = JOBS_DIR / ".worker.log"
+    cmd = [str(VENV_PYTHON), str(BATCH_SCRIPT), "worker"]
+    if num_workers > 1:
+        cmd.extend(["--workers", str(num_workers)])
     with open(log, "a") as log_fh:
         proc = subprocess.Popen(
-            [str(VENV_PYTHON), str(BATCH_SCRIPT), "worker"],
+            cmd,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -205,7 +243,7 @@ def prewarm_ollama():
     """Send a minimal prompt to Ollama to load the model into memory."""
     try:
         import requests
-        lda_model = os.environ.get("LDA_MODEL", "qwen3.5:35b-a3b")
+        lda_model = os.environ.get("LDA_MODEL", "qwen3.5-legal")
         requests.post(
             f"{OLLAMA_URL}/api/chat",
             json={
@@ -223,7 +261,7 @@ def prewarm_ollama():
 # ── Commands ──────────────────────────────────────────────
 
 
-def _submit_single(input_path: Path, output_dir: "Path | None", batch_id: str = "") -> dict:
+def _submit_single(input_path: Path, output_dir: "Path | None", batch_id: str = "", exclude_types: str = "") -> dict:
     """Submit a single file to the queue. Returns job info dict."""
     job_id = generate_job_id()
     job_dir = get_job_dir(job_id)
@@ -249,6 +287,8 @@ def _submit_single(input_path: Path, output_dir: "Path | None", batch_id: str = 
     }
     if batch_id:
         status_data["batch_id"] = batch_id
+    if exclude_types:
+        status_data["exclude_types"] = exclude_types
 
     write_status(job_dir, status_data)
 
@@ -306,8 +346,9 @@ def cmd_submit(args):
 
         batch_id = generate_batch_id()
         jobs = []
+        exclude_types = getattr(args, "exclude_types", "") or ""
         for file_path in extracted:
-            info = _submit_single(file_path, output_dir, batch_id=batch_id)
+            info = _submit_single(file_path, output_dir, batch_id=batch_id, exclude_types=exclude_types)
             jobs.append(info)
 
         ensure_worker()
@@ -320,12 +361,15 @@ def cmd_submit(args):
             )
             job["queue_position"] = pos
 
+        avg_time_per_doc = 150  # seconds
+        total_eta = len(extracted) * avg_time_per_doc
         result = {
             "status": "queued",
             "batch_id": batch_id,
             "files_found": len(extracted),
             "jobs": jobs,
-            "message": f"{len(extracted)} files extracted and queued for anonymization. Batch ID: {batch_id}",
+            "eta_minutes": total_eta // 60,
+            "message": f"{len(extracted)} files queued. ETA: ~{total_eta // 60} minutes.",
         }
         print(json.dumps(result, indent=2))
         return
@@ -339,7 +383,8 @@ def cmd_submit(args):
         sys.exit(1)
 
     batch_id = getattr(args, "batch_id", None) or ""
-    info = _submit_single(input_path, output_dir, batch_id=batch_id)
+    exclude_types = getattr(args, "exclude_types", "") or ""
+    info = _submit_single(input_path, output_dir, batch_id=batch_id, exclude_types=exclude_types)
     ensure_worker()
 
     queued = get_queued_jobs()
@@ -348,6 +393,9 @@ def cmd_submit(args):
         len(queued),
     )
 
+    avg_time_per_doc = 150  # seconds (conservative estimate for thinking model)
+    eta_minutes = (position * avg_time_per_doc) // 60
+
     result = {
         "status": "queued",
         "job_id": info["job_id"],
@@ -355,7 +403,8 @@ def cmd_submit(args):
         "filename": info["filename"],
         "input_size_kb": info["input_size_kb"],
         "output_dir": info["output_dir"],
-        "message": f"Job queued at position {position}. Use lda_batch.py status {info['job_id']} to check progress.",
+        "eta_minutes": eta_minutes,
+        "message": f"Job queued at position {position}. ETA: ~{eta_minutes} minutes.",
     }
     if batch_id:
         result["batch_id"] = batch_id
@@ -488,6 +537,12 @@ def cmd_result(args):
         except (ValueError, json.JSONDecodeError):
             pass
 
+    # Entity type breakdown
+    type_counts = {}
+    for k, v in mapping_data.get("mappings", {}).items():
+        t = v.get("type", "unknown")
+        type_counts[t] = type_counts.get(t, 0) + 1
+
     result = {
         "job_id": args.job_id,
         "status": "completed",
@@ -496,6 +551,7 @@ def cmd_result(args):
         "anonymized_size_kb": round(anon_file.stat().st_size / 1024, 1) if anon_file.exists() else 0,
         "entity_count": mapping_data.get("metadata", {}).get("entity_count", 0),
         "replacements_made": len(mapping_data.get("replacement_log", [])),
+        "entity_types": type_counts,
         "submitted_at": status_data.get("submitted_at", ""),
     }
 
@@ -831,106 +887,274 @@ def cmd_batch_status(args):
     }, indent=2))
 
 
+
+# ── Job Locking ─────────────────────────────────────────────────────
+
+
+def claim_job(job_id: str) -> bool:
+    """Atomically claim a queued job using file-based locking.
+
+    Returns True if this thread successfully claimed the job, False otherwise.
+    Uses fcntl.flock on a per-job lock file to prevent two workers from
+    picking the same job.
+    """
+    job_dir = get_job_dir(job_id)
+    lock_path = job_dir / ".claim.lock"
+
+    try:
+        lock_fd = open(lock_path, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        # Another worker already holds the lock
+        return False
+
+    try:
+        # Re-read status under lock to avoid race
+        data = read_status(job_dir)
+        if data.get("status") != "queued":
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+            return False
+
+        # Mark as running under lock
+        data["status"] = "running"
+        data["started_at"] = datetime.now().isoformat()
+        data["worker_thread"] = threading.current_thread().name
+        write_status(job_dir, data)
+
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        return True
+    except Exception:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        except Exception:
+            pass
+        return False
+
+
 # ── Worker ────────────────────────────────────────────────
 
 
+def _process_one_job(job_id: str, status_data: dict, worker_name: str = "worker"):
+    """Process a single job. Called from worker threads."""
+    job_dir = get_job_dir(job_id)
+
+    # Find the input file (preserves original extension)
+    input_copies = list(job_dir.glob("input.*"))
+    input_copy = input_copies[0] if input_copies else job_dir / "input.txt"
+    output_dir = Path(status_data.get("output_dir", str(job_dir)))
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check content cache before processing
+    cached = check_cache(input_copy)
+    if cached:
+        # Cache hit — copy results and skip LDA
+        shutil.copy2(cached / "anonymized.txt", output_dir / "anonymized.txt")
+        shutil.copy2(cached / "mapping.json", output_dir / "mapping.json")
+        # Also copy to job dir so auto-pipeline can find them
+        if output_dir != job_dir:
+            shutil.copy2(cached / "anonymized.txt", job_dir / "anonymized.txt")
+            shutil.copy2(cached / "mapping.json", job_dir / "mapping.json")
+        status_data["status"] = "completed"
+        status_data["completed_at"] = datetime.now().isoformat()
+        status_data["cache_hit"] = True
+        status_data["pid"] = None
+        write_status(job_dir, status_data)
+        log_file = job_dir / "log.txt"
+        log_file.write_text(f"Cache hit: {cached}\n")
+        return
+
+    # Notify via Signal
+    total_queued = len(get_queued_jobs()) + 1  # +1 for current job
+    batch_id_notify = status_data.get("batch_id", "")
+    filename = status_data.get("input_filename", "document")
+    batch_label = f" [{batch_id_notify}]" if batch_id_notify else ""
+    send_signal(f"\U0001f504 Anonymizing: {filename}{batch_label} ({worker_name})")
+
+    # Run lda_cli.py synchronously with timeout
+    cmd = [
+        str(VENV_PYTHON),
+        str(LDA_CLI),
+        "anonymize",
+        "--input", str(input_copy),
+        "--output-dir", str(output_dir),
+    ]
+    if status_data.get("exclude_types"):
+        cmd.extend(["--exclude-types", status_data["exclude_types"]])
+
+    log_file = job_dir / "log.txt"
+    with open(log_file, "w") as log_fh:
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                timeout=JOB_TIMEOUT,
+            )
+            exit_code = result.returncode
+        except subprocess.TimeoutExpired:
+            exit_code = -1
+            log_fh.write(f"\n[TIMEOUT] Job timed out after {JOB_TIMEOUT}s\n")
+
+    # Update status based on exit code
+    if exit_code == 0:
+        status_data["status"] = "completed"
+        status_data["completed_at"] = datetime.now().isoformat()
+        # Store in content cache for future reuse
+        try:
+            store_in_cache(input_copy, output_dir)
+        except Exception:
+            pass  # Cache storage is best-effort
+        # Notify via Signal with entity summary
+        filename = status_data.get("input_filename", "document")
+        mapping_file = output_dir / "mapping.json"
+        entity_summary = ""
+        if mapping_file.exists():
+            try:
+                with open(mapping_file) as mf:
+                    mapping = json.load(mf)
+                tc = {}
+                for k, v in mapping.get("mappings", {}).items():
+                    t = v.get("type", "unknown")
+                    tc[t] = tc.get(t, 0) + 1
+                if tc:
+                    parts = [f"{c} {t}" for t, c in sorted(tc.items())]
+                    entity_summary = " (" + ", ".join(parts) + ")"
+            except Exception:
+                pass
+        send_signal(f"\u2705 Done: {filename}{entity_summary}")
+    elif exit_code == -1:
+        # Timeout — check retry
+        retry_count = status_data.get("retry_count", 0)
+        if retry_count < MAX_RETRIES:
+            status_data["status"] = "queued"
+            status_data["retry_count"] = retry_count + 1
+            status_data["last_retry_at"] = datetime.now().isoformat()
+        else:
+            status_data["status"] = "failed"
+            status_data["error"] = f"timed out after {MAX_RETRIES + 1} attempts"
+            status_data["failed_at"] = datetime.now().isoformat()
+            filename = status_data.get("input_filename", "document")
+            send_signal(f"\u274c Failed: {filename} \u2014 {status_data['error']}")
+    else:
+        # Non-zero exit — check retry
+        retry_count = status_data.get("retry_count", 0)
+        if retry_count < MAX_RETRIES:
+            status_data["status"] = "queued"
+            status_data["retry_count"] = retry_count + 1
+            status_data["last_retry_at"] = datetime.now().isoformat()
+        else:
+            status_data["status"] = "failed"
+            status_data["failed_at"] = datetime.now().isoformat()
+            filename = status_data.get("input_filename", "document")
+            send_signal(f"\u274c Failed: {filename} \u2014 {status_data.get('error', 'unknown error')}")
+
+    # Store worker PID for state derivation (backwards compat)
+    status_data["pid"] = None
+    write_status(job_dir, status_data)
+
+
+def _worker_loop(worker_name: str = "worker-0"):
+    """Single worker loop: claim and process jobs until queue is empty.
+
+    Uses file-based locking (claim_job) so multiple loops can run safely
+    in parallel without picking the same job.
+    """
+    while True:
+        queued = get_queued_jobs()
+        if not queued:
+            break
+
+        claimed = False
+        for job_id, status_data in queued:
+            if claim_job(job_id):
+                # Re-read status after claiming (claim_job set it to running)
+                job_dir = get_job_dir(job_id)
+                status_data = read_status(job_dir)
+                try:
+                    _process_one_job(job_id, status_data, worker_name=worker_name)
+                except Exception as e:
+                    # Catch unexpected errors so the worker loop continues
+                    status_data["status"] = "failed"
+                    status_data["error"] = str(e)
+                    status_data["failed_at"] = datetime.now().isoformat()
+                    status_data["pid"] = None
+                    write_status(job_dir, status_data)
+                claimed = True
+                break
+
+        if not claimed:
+            # All queued jobs were claimed by other workers; wait briefly
+            time.sleep(1)
+            # Check again — if still nothing, exit
+            if not get_queued_jobs():
+                break
+
+
+def _send_batch_summaries():
+    """Check for completed batches and send Signal summary notifications."""
+    completed_batches = {}
+    for jd in JOBS_DIR.iterdir():
+        if not jd.is_dir() or not jd.name.startswith("lda-"):
+            continue
+        data = read_status(jd)
+        bid = data.get("batch_id", "")
+        if not bid:
+            continue
+        state = derive_state(jd, data)
+        completed_batches.setdefault(bid, {"total": 0, "completed": 0, "failed": 0})
+        completed_batches[bid]["total"] += 1
+        if state == "completed":
+            completed_batches[bid]["completed"] += 1
+        elif state == "failed":
+            completed_batches[bid]["failed"] += 1
+
+    for bid, counts in completed_batches.items():
+        if counts["total"] > 0 and counts["completed"] + counts["failed"] == counts["total"]:
+            msg = f"\U0001f4e6 Batch {bid} complete: {counts['completed']}/{counts['total']} succeeded"
+            if counts["failed"] > 0:
+                msg += f", {counts['failed']} failed"
+            send_signal(msg)
+
+
 def cmd_worker(args):
-    """Background worker: process queued jobs sequentially, exit when empty."""
+    """Background worker: process queued jobs, exit when empty.
+
+    Supports parallel processing via --workers N (default 1).
+    Multiple worker threads each run their own loop, using file-based
+    locking to safely claim jobs from the shared queue.
+    """
+    num_workers = getattr(args, "workers", DEFAULT_WORKERS) or DEFAULT_WORKERS
     WORKER_PID_FILE.write_text(str(os.getpid()))
 
     # Pre-warm Ollama to load the model before first job
     prewarm_ollama()
 
     try:
-        while True:
-            queued = get_queued_jobs()
-            if not queued:
-                break
+        if num_workers <= 1:
+            # Single worker — simple path, no threads
+            _worker_loop(worker_name="worker")
+        else:
+            # Parallel workers using ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="lda-worker") as executor:
+                futures = []
+                for i in range(num_workers):
+                    f = executor.submit(_worker_loop, worker_name=f"worker-{i}")
+                    futures.append(f)
 
-            job_id, status_data = queued[0]
-            job_dir = get_job_dir(job_id)
+                # Wait for all workers to finish and propagate exceptions
+                for f in as_completed(futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        # Log but do not crash — other workers continue
+                        print(f"Worker thread error: {e}", file=sys.stderr)
 
-            # Find the input file (preserves original extension)
-            input_copies = list(job_dir.glob("input.*"))
-            input_copy = input_copies[0] if input_copies else job_dir / "input.txt"
-            output_dir = Path(status_data.get("output_dir", str(job_dir)))
-
-            # Check content cache before processing
-            cached = check_cache(input_copy)
-            if cached:
-                # Cache hit — copy results and skip LDA
-                shutil.copy2(cached / "anonymized.txt", output_dir / "anonymized.txt")
-                shutil.copy2(cached / "mapping.json", output_dir / "mapping.json")
-                status_data["status"] = "completed"
-                status_data["completed_at"] = datetime.now().isoformat()
-                status_data["cache_hit"] = True
-                status_data["pid"] = None
-                write_status(job_dir, status_data)
-                log_file = job_dir / "log.txt"
-                log_file.write_text(f"Cache hit: {cached}\n")
-                continue
-
-            status_data["status"] = "running"
-            status_data["started_at"] = datetime.now().isoformat()
-            write_status(job_dir, status_data)
-
-            # Run lda_cli.py synchronously with timeout
-            cmd = [
-                str(VENV_PYTHON),
-                str(LDA_CLI),
-                "anonymize",
-                "--input", str(input_copy),
-                "--output-dir", str(output_dir),
-            ]
-
-            log_file = job_dir / "log.txt"
-            with open(log_file, "w") as log_fh:
-                try:
-                    result = subprocess.run(
-                        cmd,
-                        stdout=log_fh,
-                        stderr=subprocess.STDOUT,
-                        timeout=JOB_TIMEOUT,
-                    )
-                    exit_code = result.returncode
-                except subprocess.TimeoutExpired:
-                    exit_code = -1
-                    log_fh.write(f"\n[TIMEOUT] Job timed out after {JOB_TIMEOUT}s\n")
-
-            # Update status based on exit code
-            if exit_code == 0:
-                status_data["status"] = "completed"
-                status_data["completed_at"] = datetime.now().isoformat()
-                # Store in content cache for future reuse
-                try:
-                    store_in_cache(input_copy, output_dir)
-                except Exception:
-                    pass  # Cache storage is best-effort
-            elif exit_code == -1:
-                # Timeout — check retry
-                retry_count = status_data.get("retry_count", 0)
-                if retry_count < MAX_RETRIES:
-                    status_data["status"] = "queued"
-                    status_data["retry_count"] = retry_count + 1
-                    status_data["last_retry_at"] = datetime.now().isoformat()
-                else:
-                    status_data["status"] = "failed"
-                    status_data["error"] = f"timed out after {MAX_RETRIES + 1} attempts"
-                    status_data["failed_at"] = datetime.now().isoformat()
-            else:
-                # Non-zero exit — check retry
-                retry_count = status_data.get("retry_count", 0)
-                if retry_count < MAX_RETRIES:
-                    status_data["status"] = "queued"
-                    status_data["retry_count"] = retry_count + 1
-                    status_data["last_retry_at"] = datetime.now().isoformat()
-                else:
-                    status_data["status"] = "failed"
-                    status_data["failed_at"] = datetime.now().isoformat()
-
-            # Store worker PID for state derivation (backwards compat)
-            status_data["pid"] = None
-            write_status(job_dir, status_data)
+        # After all workers finish, send batch summaries
+        _send_batch_summaries()
 
     finally:
         # Clean up PID file
@@ -946,7 +1170,7 @@ def cmd_worker(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LDA Batch Processor — sequential job queue for long documents",
+        description="LDA Batch Processor — parallel job queue for long documents",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -954,6 +1178,7 @@ def main():
     sub.add_argument("input", help="Path to the input file")
     sub.add_argument("--output-dir", default=None, help="Output directory (default: job dir)")
     sub.add_argument("--batch-id", default=None, help="Assign to a batch (for grouped tracking)")
+    sub.add_argument("--exclude-types", default="", help="Comma-separated entity types to exclude from anonymization")
 
     sub = subparsers.add_parser("status", help="Check job status")
     sub.add_argument("job_id", help="Job ID")
@@ -976,7 +1201,8 @@ def main():
     sub = subparsers.add_parser("batch-status", help="Check status of all jobs in a batch")
     sub.add_argument("batch_id", help="Batch ID")
 
-    subparsers.add_parser("worker", help="(internal) Background worker process")
+    sub = subparsers.add_parser("worker", help="(internal) Background worker process")
+    sub.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Number of concurrent worker threads (default: {DEFAULT_WORKERS})")
 
     args = parser.parse_args()
 
